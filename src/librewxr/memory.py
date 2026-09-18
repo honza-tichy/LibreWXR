@@ -2,8 +2,12 @@
 # Copyright (C) 2026 Joshua Kimsey
 """Memory pressure monitor — safety net to prevent OOM kills.
 
-Periodically checks process RSS against the container/system memory
+Periodically checks unreclaimable memory against the container/system
 limit and proactively evicts caches before the OOM killer intervenes.
+
+Reclaimable page cache is excluded on purpose: the radar and NWP stores
+are file-backed memmaps, so counting their cache would have the monitor
+evicting caches to relieve pressure created by its own caches.
 """
 import asyncio
 import ctypes
@@ -70,27 +74,77 @@ def detect_memory_limit_mb(override_mb: int = 0) -> int:
     return psutil.virtual_memory().total // (1024 * 1024)
 
 
-def _read_cgroup_memory_usage() -> int | None:
-    """Return the cgroup's current memory usage in bytes, or None.
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+# cgroup v2 ``memory.stat`` keys that the kernel CANNOT reclaim under
+# pressure.  Everything omitted — above all the page cache behind
+# file-backed memmaps — is dropped on demand and never causes an OOM
+# kill, so counting it as pressure is counting our own cache against us.
+#
+# ``shmem`` is included even though it is accounted under ``file``: it is
+# tmpfs-backed and cannot be reclaimed without swap, which is where the
+# non-persistent frame/nowcast memmaps land if /tmp is a tmpfs mount.
+_V2_UNRECLAIMABLE_KEYS = (
+    "anon",
+    "shmem",
+    "slab_unreclaimable",
+    "kernel_stack",
+    "pagetables",
+    "percpu",
+    "sock",
+)
+
+
+def _parse_memory_stat(path: Path) -> dict[str, int] | None:
+    """Parse a cgroup ``memory.stat`` into a key→bytes dict, or None."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        key, _, raw = line.partition(" ")
+        try:
+            values[key] = int(raw)
+        except ValueError:
+            continue  # nested/percpu lines that aren't a plain integer
+    return values
+
+
+def _read_cgroup_unreclaimable_bytes(cgroup_root: Path = _CGROUP_ROOT) -> int | None:
+    """Return the cgroup's UNRECLAIMABLE memory in bytes, or None.
 
     Captures every process in the container — important in multi-worker
     mode where each render worker's own RSS is only a fraction of the
-    container's total.  Falls back to ``None`` outside containers so
-    callers can use per-process RSS instead.
-    """
-    # cgroup v2
-    try:
-        v2 = Path("/sys/fs/cgroup/memory.current").read_text().strip()
-        return int(v2)
-    except (FileNotFoundError, ValueError, PermissionError):
-        pass
+    container's total.  Returns ``None`` outside containers so callers
+    can use per-process RSS instead.
 
-    # cgroup v1
-    try:
-        v1 = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip()
-        return int(v1)
-    except (FileNotFoundError, ValueError, PermissionError):
-        pass
+    Deliberately NOT ``memory.current``: that includes page cache, and
+    this project memmaps multi-GB radar/NWP stores to ``cache_dir`` by
+    design.  Reading it raw made the monitor fire on its own caches — in
+    production, ``anon`` 1.6 GiB + ``slab`` 0.2 GiB against a 12 GiB cap
+    was reported as "12103 MB / 11000 MB (110%)", because 6.7 GiB of
+    reclaimable page cache was counted as pressure.  The monitor then
+    cleared the tile and coordinate caches (~10 s to rebuild) several
+    times per fetch cycle to relieve pressure that did not exist, while
+    ``memory.events`` showed ``oom_kill 0`` over 20 hours.
+
+    Summing the unreclaimable keys instead makes the limit mean what the
+    thresholds assume: how close we are to an actual OOM kill.
+    """
+    # cgroup v2 — ``anon`` is the discriminator; v1 has ``rss`` instead.
+    v2 = _parse_memory_stat(cgroup_root / "memory.stat")
+    if v2 is not None and "anon" in v2:
+        return sum(v2.get(key, 0) for key in _V2_UNRECLAIMABLE_KEYS)
+
+    # cgroup v1 — ``total_*`` are the hierarchy-inclusive variants.
+    # ``rss`` here already excludes page cache but also excludes shmem,
+    # which lives in ``cache``, so add it back.
+    v1 = _parse_memory_stat(cgroup_root / "memory" / "memory.stat")
+    if v1 is not None:
+        rss = v1.get("total_rss", v1.get("rss"))
+        if rss is not None:
+            return rss + v1.get("total_shmem", v1.get("shmem", 0))
 
     return None
 
@@ -114,7 +168,11 @@ class MemoryMonitor:
         self._process = psutil.Process()
 
     async def start(self) -> None:
-        scope = "container (cgroup)" if _read_cgroup_memory_usage() is not None else "process"
+        scope = (
+            "container (cgroup)"
+            if _read_cgroup_unreclaimable_bytes() is not None
+            else "process"
+        )
         logger.info(
             "Memory monitor started (scope=%s, limit=%d MB, check every %ds, "
             "warn=%.0f%%, evict_tiles=%.0f%%, evict_all=%.0f%%)",
@@ -149,7 +207,7 @@ class MemoryMonitor:
         # every worker sees the same shared pressure and they all evict
         # their local caches in concert.  Falls back to per-process RSS
         # outside containers (local dev, single-process deployments).
-        cgroup_usage = _read_cgroup_memory_usage()
+        cgroup_usage = _read_cgroup_unreclaimable_bytes()
         if cgroup_usage is not None:
             rss = cgroup_usage
         else:
