@@ -561,3 +561,97 @@ class TestSatelliteBackgroundFetch:
         with caplog.at_level("WARNING"):
             await fetcher._fetch_satellite_background(_StubSatelliteContribution(boom))
         assert any("fetch failed" in r.message for r in caplog.records)
+
+
+class _StubGrid:
+    """NWP grid stand-in.  ``fetch`` takes no kwargs, so the signature
+    inspection in _fetch_auxiliary_grids passes an empty kwargs dict."""
+
+    def __init__(self, behavior):
+        self._behavior = behavior
+
+    async def fetch(self) -> None:
+        await self._behavior()
+
+
+class _StubNWPContribution:
+    def __init__(self, behavior, name="WRF-SMN"):
+        self.name = name
+        self.instance = _StubGrid(behavior)
+
+
+def _build_nwp_fetcher(contributions):
+    """Bare fetcher with just the state _fetch_auxiliary_grids touches."""
+    fetcher = RadarFetcher.__new__(RadarFetcher)
+    fetcher._nwp_contributions = contributions
+    fetcher._satellite_contributions = []
+    fetcher._satellite_tasks = {}
+    return fetcher
+
+
+class TestNWPFetchDeadline:
+    async def test_slow_grid_times_out_so_the_cycle_can_reach_radar(
+        self, monkeypatch, caplog
+    ):
+        """A slow NWP source must not hold the cycle open indefinitely.
+
+        _fetch_all_frames awaits _fetch_auxiliary_grids BEFORE fetching
+        radar, so an un-deadlined grid stalls radar as well as its own
+        layer.  Observed 2026-09-18: WRF-SMN took 23-25 min per fetch for
+        ~100 min, radar aged past the staleness limit, and the watchdog
+        restarted into the same wait four times over.
+        """
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "nwp_fetch_timeout", 0.05)
+
+        async def hang() -> None:
+            await asyncio.sleep(30)
+
+        fetcher = _build_nwp_fetcher([_StubNWPContribution(hang)])
+        with caplog.at_level("WARNING"):
+            # Must not take ~30s: the deadline, not the source, ends this.
+            await asyncio.wait_for(fetcher._fetch_auxiliary_grids(), timeout=5)
+
+        assert any("timed out" in r.message for r in caplog.records)
+        assert any("WRF-SMN" in r.message for r in caplog.records)
+
+    async def test_deadline_is_per_source_not_per_cycle(self, monkeypatch):
+        """One timing-out grid must not abort its healthy neighbours."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "nwp_fetch_timeout", 0.05)
+        monkeypatch.setattr(settings, "nwp_fetch_concurrency", 4)
+        finished: list[str] = []
+
+        async def hang() -> None:
+            await asyncio.sleep(30)
+
+        async def quick() -> None:
+            finished.append("quick")
+
+        fetcher = _build_nwp_fetcher([
+            _StubNWPContribution(hang, name="WRF-SMN"),
+            _StubNWPContribution(quick, name="ICON-EU"),
+        ])
+        await asyncio.wait_for(fetcher._fetch_auxiliary_grids(), timeout=5)
+
+        assert finished == ["quick"]
+
+    async def test_failed_grid_still_warns_without_the_timeout_path(
+        self, monkeypatch, caplog
+    ):
+        """A grid that raises keeps the pre-existing failure message."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "nwp_fetch_timeout", 30.0)
+
+        async def boom() -> None:
+            raise RuntimeError("grib exploded")
+
+        fetcher = _build_nwp_fetcher([_StubNWPContribution(boom)])
+        with caplog.at_level("WARNING"):
+            await fetcher._fetch_auxiliary_grids()
+
+        assert any("fetch failed" in r.message for r in caplog.records)
+        assert not any("timed out" in r.message for r in caplog.records)

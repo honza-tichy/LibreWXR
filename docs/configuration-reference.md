@@ -990,6 +990,19 @@ Maximum number of NWP grid fetches running in parallel inside one fetch cycle. E
 
 4 fits comfortably in 8 GB; bump to 6-8 on bigger rigs (multi mode has a separate pipeline container with its own memory budget, so it can usually go higher) to bring cycle wall time closer to the slowest single source.
 
+### `LIBREWXR_NWP_FETCH_TIMEOUT`
+
+Deadline in seconds for a single NWP grid fetch. A grid that overruns is abandoned for that cycle, logged at WARNING, and retried on the next one.
+
+| | |
+|---|---|
+| **Default** | `300` |
+| **Type** | float (seconds) |
+
+This matters more than a per-layer timeout normally would: the fetch cycle gathers every enabled grid and fetches radar only afterwards, so an un-deadlined slow source stalls **radar** as well as its own layer. A source degrading from sub-minute to tens of minutes will age radar frames past any external staleness monitor, and restarting the server re-enters the same wait from scratch rather than recovering.
+
+300 s is roughly 20x the p99 of a healthy fetch (the slowest, ECMWF IFS and DMI DINI, run ~30-60 s), so a fetch that trips this is pathological rather than unlucky. Raise it only if a legitimately large grid on a slow link times out repeatedly.
+
 ---
 
 ## Nowcasting
