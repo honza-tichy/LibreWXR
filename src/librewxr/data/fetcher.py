@@ -554,9 +554,25 @@ class RadarFetcher:
                 async with semaphore:
                     started = time.time()
                     try:
-                        await grid.fetch(**kwargs)
+                        # Every grid is gathered before the cycle completes, so an
+                        # un-deadlined slow source holds back the *next* radar
+                        # cycle too — not just its own layer.  Bound it: a grid
+                        # that overruns is left stale for this cycle and retried
+                        # on the next one.
+                        await asyncio.wait_for(
+                            grid.fetch(**kwargs), timeout=settings.nwp_fetch_timeout,
+                        )
                         logger.info(
                             "%s fetch finished in %.1fs", label, time.time() - started,
+                        )
+                    except TimeoutError:
+                        # WARNING, not DEBUG: a source that keeps tripping this
+                        # is the signal that something upstream is degraded, and
+                        # the previous silence is what made the 2026-09-18 stall
+                        # take a day to find.
+                        logger.warning(
+                            "%s fetch timed out after %.0fs, NWP layer may be stale",
+                            label, settings.nwp_fetch_timeout,
                         )
                     except Exception:
                         logger.warning(fail_msg)

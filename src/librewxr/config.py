@@ -580,6 +580,23 @@ class Settings(BaseSettings):
     # decode RAM around 1.6 GB; raise on fatter rigs to shorten backfill
     # wall time.
     radar_fetch_concurrency: int = 8
+    # Deadline for one NWP grid fetch.  The cycle gathers every enabled
+    # grid and *then* fetches radar, so the whole cycle — radar included —
+    # is gated on the slowest single source.  Without a deadline one slow
+    # upstream stalls radar for as long as it likes.
+    #
+    # Observed 2026-09-18: SMN Argentina (WRF-SMN) went from <1 min to
+    # 23-25 min per fetch for about 100 minutes.  Radar frames aged past
+    # the 30-minute staleness limit four times, each triggering an
+    # external watchdog restart that re-entered the same 24-minute wait
+    # from scratch — so the restarts prevented recovery rather than
+    # causing it.  A deadline turns that into "WRF-SMN is stale for a
+    # cycle", which is what a degraded auxiliary source should cost.
+    #
+    # 300 s is ~20x the normal p99 for every grid in the chain (the
+    # slowest healthy fetches are ECMWF IFS and DMI DINI at ~30-60 s), so
+    # a fetch that trips this is pathological, not merely unlucky.
+    nwp_fetch_timeout: float = 300.0
     cors_origins: list[str] = ["*"]
 
     @model_validator(mode="before")
