@@ -655,3 +655,80 @@ class TestNWPFetchDeadline:
 
         assert any("fetch failed" in r.message for r in caplog.records)
         assert not any("timed out" in r.message for r in caplog.records)
+
+
+class _RecordingSource(_FakeSource):
+    """_FakeSource that records the raw arg it was handed, untouched.
+
+    The base class coerces the archive arg via ``int(dt.timestamp())``,
+    which would itself blow up on a wrongly-typed value — this keeps the
+    assertion about *which* arg arrived, not about its type.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.raw_live: list = []
+        self.raw_archive: list = []
+
+    async def fetch_frame(self, region, minutes_ago):
+        self.raw_live.append(minutes_ago)
+        return self._build_array(region)
+
+    async def fetch_archive_frame(self, region, dt):
+        self.raw_archive.append(dt)
+        return self._build_array(region)
+
+
+class _NeverSource(_FakeSource):
+    """Primary that always returns None, forcing the fallback path."""
+
+    async def fetch_frame(self, region, minutes_ago):
+        return None
+
+    async def fetch_archive_frame(self, region, dt):
+        return None
+
+
+class TestSourceArgIsPerFrame:
+    """_fetch_timestamps must hand each frame its OWN source_arg.
+
+    Regression: source_arg was read in the results loop but bound only by
+    the task-building loop, so every frame received the last entry's arg.
+    ts_and_sources is ordered newest-first with live entries for frames
+    under 55 min and archive entries beyond, so the leaked value was
+    always the oldest frame's datetime.
+    """
+
+    @pytest.fixture
+    def cacomp_region(self):
+        return RegionDef(
+            name="CACOMP",
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="CA",
+            grid_width=32, grid_height=32,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_gets_each_frames_own_arg(self, cacomp_region):
+        from datetime import datetime, timezone
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, cacomp_region)
+        fetcher._sources = {cacomp_region.name: _NeverSource()}
+        fetcher._ca_source = "mrms_with_msc_blend"
+        msc = _RecordingSource()
+        fetcher._cacomp_msc_source = msc
+
+        dt2000 = datetime.fromtimestamp(2000, tz=timezone.utc)
+        dt3000 = datetime.fromtimestamp(3000, tz=timezone.utc)
+        await fetcher._fetch_timestamps([
+            (1000, "live", 0),
+            (2000, "archive", dt2000),
+            (3000, "archive", dt3000),
+        ])
+
+        # With the leak, source_arg was dt3000 throughout: the live frame
+        # got a datetime where minutes_ago belongs (TypeError against the
+        # real MSC source), and ts=2000 was silently fetched at dt3000.
+        assert msc.raw_live == [0]
+        assert msc.raw_archive == [dt2000, dt3000]

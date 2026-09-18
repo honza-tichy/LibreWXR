@@ -494,7 +494,11 @@ class RadarFetcher:
         # For each timestamp, fetch regions in parallel (skipping any
         # already present from a previous partial fetch).
         tasks = []
-        task_meta: list[tuple[int, RegionDef, str]] = []
+        # ``source_arg`` MUST be carried here alongside the rest.  It used to
+        # be read in the results loop below straight from this build loop's
+        # leaked binding, i.e. always the last entry's value — see the
+        # rebinding note there.
+        task_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
 
         for ts, source_type, source_arg in ts_and_sources:
             have = skip_regions.get(ts, set()) if skip_regions else set()
@@ -506,7 +510,7 @@ class RadarFetcher:
                     tasks.append(source.fetch_frame(region, source_arg))
                 else:
                     tasks.append(source.fetch_archive_frame(region, source_arg))
-                task_meta.append((ts, region, source_type))
+                task_meta.append((ts, region, source_type, source_arg))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -517,7 +521,12 @@ class RadarFetcher:
         frames_by_ts: dict[int, dict[str, np.ndarray]] = {
             ts: {} for ts, _, _ in ts_and_sources
         }
-        for (ts, region, source_type), result in zip(task_meta, results):
+        # Every name used below must be unpacked here.  ``source_arg`` in
+        # particular: leaving it to the build loop's binding silently handed
+        # _try_fallback and _blend_cacomp the LAST entry's arg for every frame
+        # — a TypeError on live frames, and the wrong timestamp (no error, no
+        # log) on archive ones.
+        for (ts, region, source_type, source_arg), result in zip(task_meta, results):
             if isinstance(result, Exception):
                 logger.warning(
                     "Failed to fetch %s for ts=%d: %s", region.name, ts, result
