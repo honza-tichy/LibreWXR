@@ -732,3 +732,105 @@ class TestSourceArgIsPerFrame:
         # real MSC source), and ts=2000 was silently fetched at dt3000.
         assert msc.raw_live == [0]
         assert msc.raw_archive == [dt2000, dt3000]
+
+
+class _HangingSource(_FakeSource):
+    """Never returns — stands in for a degraded far-end endpoint."""
+
+    async def fetch_frame(self, region, minutes_ago):
+        await asyncio.sleep(30)
+
+    async def fetch_archive_frame(self, region, dt):
+        await asyncio.sleep(30)
+
+
+class TestRadarFetchDeadline:
+    """One slow region must not set the whole cycle's wall time.
+
+    Regression 2026-09-21: the East Asia radar endpoints degraded, the
+    per-region fetches ran for minutes under their own generous HTTP
+    timeouts (CWA: 90 s read x 2 attempts per file), and the gather in
+    _fetch_timestamps held the cycle open for 600-950 s against a
+    80-250 s baseline.  Cycles overran their 10-minute boundary, frames
+    stopped landing, and the external watchdog restarted a server that
+    was working — eight times in five hours, each costing a backfill.
+    """
+
+    @pytest.fixture
+    def region(self):
+        return RegionDef(
+            name="TWCOMP",
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="TW",
+            grid_width=32, grid_height=32,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hanging_region_is_abandoned_not_waited_on(
+        self, region, monkeypatch, caplog
+    ):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 0.05)
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, region)
+        fetcher._sources = {region.name: _HangingSource()}
+
+        with caplog.at_level("WARNING"):
+            # Must not take ~30 s: the deadline ends this, not the source.
+            await asyncio.wait_for(
+                fetcher._fetch_timestamps([(1000, "live", 0)]), timeout=5,
+            )
+
+        assert any("timed out" in r.message for r in caplog.records)
+        assert any("TWCOMP" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_deadline_is_per_region_so_healthy_ones_still_land(
+        self, region, monkeypatch
+    ):
+        """A hanging region must not cost its healthy neighbours' frames."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 0.05)
+        healthy = RegionDef(
+            name="OPERA",
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="EU",
+            grid_width=32, grid_height=32,
+        )
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, region)
+        fetcher._enabled_regions = [region, healthy]
+        fetcher._sources = {
+            region.name: _HangingSource(),
+            healthy.name: _FakeSource(fill_value=70),
+        }
+
+        await asyncio.wait_for(
+            fetcher._fetch_timestamps([(1000, "live", 0)]), timeout=5,
+        )
+
+        frame = await store.get_frame(1000)
+        assert frame is not None
+        # The frame exists and carries the healthy region only.
+        assert set(frame.regions) == {"OPERA"}
+
+    @pytest.mark.asyncio
+    async def test_fast_region_is_untouched_by_the_deadline(
+        self, region, monkeypatch, caplog
+    ):
+        """A region that answers in time keeps its data and logs nothing."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
+        store = FrameStore(max_frames=8)
+        fetcher, source = _build_fetcher(store, TileCache(max_mb=1), None, region)
+
+        with caplog.at_level("WARNING"):
+            await fetcher._fetch_timestamps([(1000, "live", 0)])
+
+        assert source.live_calls == [("TWCOMP", 0)]
+        frame = await store.get_frame(1000)
+        assert frame is not None and "TWCOMP" in frame.regions
+        assert not any("timed out" in r.message for r in caplog.records)

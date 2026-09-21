@@ -414,6 +414,25 @@ class Settings(BaseSettings):
     # slowest healthy fetches are ECMWF IFS and DMI DINI at ~30-60 s), so
     # a fetch that trips this is pathological, not merely unlucky.
     nwp_fetch_timeout: float = 300.0
+    # Deadline for ONE region's radar fetch within a cycle.  The radar
+    # stage gathers every enabled region and the cycle does not complete
+    # until the slowest one returns, so a single degraded upstream sets
+    # the cycle's wall time — and once that exceeds the 10-minute
+    # boundary, frames stop landing and an external staleness monitor
+    # starts restarting a server that is working perfectly.
+    #
+    # Observed 2026-09-21: the East Asia endpoints (CWA Taiwan, JMA
+    # tiles) degraded over ~2 h — first slow, later failing outright (51
+    # transport errors in 4 h against 1-4/h overnight).  Cycles went from
+    # 80-250 s to 600-950 s, eight watchdog restarts in five hours, each
+    # costing a full backfill.  Per-source HTTP timeouts do not bound
+    # this: CWA alone allows 90 s read x 2 attempts per file, and a
+    # region fetches several files.
+    #
+    # 120 s is ~10x a healthy region fetch.  A region that trips it is
+    # absent from this frame and retried next cycle — one stale region
+    # instead of a stale map.
+    radar_fetch_timeout: float = 120.0
     cors_origins: list[str] = ["*"]
 
     @field_validator("mode", mode="before")

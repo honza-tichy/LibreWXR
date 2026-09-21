@@ -1003,6 +1003,21 @@ This matters more than a per-layer timeout normally would: the fetch cycle gathe
 
 300 s is roughly 20x the p99 of a healthy fetch (the slowest, ECMWF IFS and DMI DINI, run ~30-60 s), so a fetch that trips this is pathological rather than unlucky. Raise it only if a legitimately large grid on a slow link times out repeatedly.
 
+### `LIBREWXR_RADAR_FETCH_TIMEOUT`
+
+Deadline in seconds for one region's radar fetch inside a cycle. A region that overruns is absent from that frame, logged at WARNING, and retried on the next cycle.
+
+| | |
+|---|---|
+| **Default** | `120` |
+| **Type** | float (seconds) |
+
+The radar stage gathers every enabled region and the cycle does not complete until the slowest one returns, so without a deadline a single degraded upstream sets the whole cycle's wall time. That is worse than it sounds: once a cycle takes longer than the 10-minute frame boundary, frames stop being published, and from outside the server looks dead while every internal component is healthy. External staleness monitors then restart it, which costs a full backfill and makes the next cycle slower still.
+
+Per-source HTTP timeouts do not bound this on their own. They are set per upstream and apply per request, not per region — one source allows a 90 s read, twice per file under the retry helper, with several files per region fetch.
+
+120 s is roughly 10x a healthy region fetch. Raise it for a legitimately slow upstream you would rather wait for than lose; lower it if you would rather drop a region than let cycles drift toward the boundary.
+
 ---
 
 ## Nowcasting
