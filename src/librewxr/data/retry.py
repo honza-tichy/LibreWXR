@@ -23,9 +23,18 @@ async def retry_get(
     """Retry an async HTTP GET on transient errors.
 
     Retries on ``httpx.TransportError`` (connection refused, timeout,
-    DNS failure) and ``httpx.DecodeError`` (truncated response body).
-    Does **not** retry on ``httpx.HTTPStatusError`` — the server
-    responded, retrying won't help.
+    DNS failure) and ``httpx.DecodingError`` (truncated or corrupt
+    response body).  Does **not** retry on ``httpx.HTTPStatusError`` —
+    the server responded, retrying won't help.
+
+    The decode class is ``DecodingError``; httpx has never exported a
+    ``DecodeError``.  Naming it that way did not merely disable the
+    retry: an ``except`` clause is *evaluated* for every exception that
+    reaches it, so the bad attribute lookup raised ``AttributeError``
+    from inside the handler and replaced whatever was actually in
+    flight — including ``CancelledError``, which turned every
+    cancellation of a fetch (shutdown, and every ``asyncio.wait_for``
+    deadline in the fetch path) into an unrelated error.
 
     Returns the ``httpx.Response`` on success, or ``None`` if all
     attempts fail due to transport/decode errors.
@@ -49,7 +58,7 @@ async def retry_get(
                     "%s: transport error after %d retries, giving up",
                     name, retries,
                 )
-        except httpx.DecodeError:
+        except httpx.DecodingError:
             if attempt < retries:
                 name = log_name or url.split("/")[-1]
                 logger.info(
