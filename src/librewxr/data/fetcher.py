@@ -778,9 +778,20 @@ class RadarFetcher:
                     continue
                 source = self._sources[region.name]
                 if source_type == "live":
-                    tasks.append(_bounded_fetch(sem, source.fetch_frame(region, source_arg)))
+                    coro = source.fetch_frame(region, source_arg)
                 else:
-                    tasks.append(_bounded_fetch(sem, source.fetch_archive_frame(region, source_arg)))
+                    coro = source.fetch_archive_frame(region, source_arg)
+                # Bound each region independently.  The gather below does
+                # not return until the slowest region does, so without a
+                # deadline one degraded upstream sets the cycle's wall
+                # time — and a cycle that overruns its 10-minute boundary
+                # stops publishing frames, which reads from outside as
+                # the server being dead (2026-09-21, CWA/JMA).  The deadline
+                # sits inside the concurrency slot, so time spent queued
+                # behind other regions doesn't count against it.
+                tasks.append(_bounded_fetch(
+                    sem, asyncio.wait_for(coro, timeout=settings.radar_fetch_timeout),
+                ))
                 task_meta.append((ts, region, source_type, source_arg))
 
         radar_start = time.monotonic()
@@ -805,6 +816,17 @@ class RadarFetcher:
         finalize_coros: list[Awaitable[np.ndarray | None]] = []
         finalize_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
         for (ts, region, source_type, source_arg), result in zip(task_meta, results):
+            if isinstance(result, asyncio.TimeoutError):
+                # WARNING, not DEBUG: a region that keeps tripping this is
+                # the signal that an upstream is degraded.  The 2026-09-21
+                # stall logged nothing at all for the ten minutes it spent
+                # inside these fetches, which is what made it hard to find.
+                logger.warning(
+                    "%s: fetch timed out after %.0fs for ts=%d — region "
+                    "absent from this frame, retrying next cycle",
+                    region.name, settings.radar_fetch_timeout, ts,
+                )
+                continue
             if isinstance(result, Exception):
                 logger.warning(
                     "Failed to fetch %s for ts=%d: %s", region.name, ts, result
