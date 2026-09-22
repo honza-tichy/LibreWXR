@@ -133,6 +133,50 @@ This is the starting point for any integration. It returns metadata about all av
 | `satellite.infrared` | Array of GMGSI satellite frames, oldest first. Hourly cadence, up to 12 hours. May be empty if satellite is disabled or still loading. |
 | `time` | Unix timestamp (seconds) of the frame. |
 | `path` | Path prefix for tile requests for this frame. |
+| `radar.coverage` | **LibreWXR extension** (not in Rain Viewer). Per-region footprints and health — see below. |
+
+#### `radar.coverage` — knowing when a frame is not what it looks like
+
+A radar frame is a composite of regional sources. When one region's
+upstream fails, LibreWXR either carries that region's previous data
+forward or leaves it out; either way the frame still appears in
+`radar.past` and still renders. Without this block a client cannot tell
+live echo from a frozen copy, or from NWP model fill where a region is
+missing entirely.
+
+```json
+"coverage": {
+  "regions": [
+    { "id": "USCOMP", "label": "United States",
+      "bounds": [-126, 23, -65, 50], "px": 0.005 },
+    { "id": "TWCOMP", "label": "Taiwan",
+      "bounds": [115, 18, 126.5125, 29.0125], "px": 0.0125 }
+  ],
+  "degraded": {
+    "TWCOMP": {
+      "carried": [1700000400],
+      "absent":  [1700001000],
+      "latestObserved": 1699999800
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `regions[].bounds` | `[west, south, east, north]` in degrees. A **bounding box, not an exact footprint** — projected regions (OPERA, ITCOMP, JPCOMP) cover a curved quadrilateral inside it. |
+| `regions[].px` | Lon-axis degrees per pixel. Regions overlap (ITCOMP inside OPERA, CACOMP across USCOMP); the **smaller `px` wins**, so resolving a point to its region means picking the finest match, not the first. |
+| `degraded` | Sparse — a region in good health is omitted entirely, so a healthy server sends `{}`. |
+| `degraded[].carried` | Frame timestamps where this region is a copy of an older observation. Real echo, frozen in place. |
+| `degraded[].absent` | Frame timestamps with no data for this region at all; the tile falls through to NWP model fill there. |
+| `degraded[].latestObserved` | Newest genuine observation of this region. **May predate the oldest frame** — a carry-forward chain can outlive the frame window — so use it for an age, not as an index into `past`. `null` means never observed in this window. |
+
+Nowcast frames carry no coverage: they come from a separate store with
+no region concept. A client may reasonably treat a prediction
+extrapolated from a degraded frame as degraded itself.
+
+The whole block is additive. Clients written against Rain Viewer ignore
+it, and `past` frames remain exactly `{time, path}`.
 
 ### Tile URL Format
 

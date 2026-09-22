@@ -105,6 +105,33 @@ REGION_GROUPS: dict[str, list[str]] = {
 }
 
 
+# Human-readable names, for anything a person reads rather than a
+# machine matches on — "Taiwan radar 40 min old" beats "TWCOMP radar".
+# Kept centrally rather than as a field on each source package's
+# RegionDef so this stays one file to edit; a source that wants to name
+# itself can still set ``RegionDef.label`` and win.
+REGION_LABELS: dict[str, str] = {
+    "USCOMP": "United States",
+    "AKCOMP": "Alaska",
+    "HICOMP": "Hawaii",
+    "PRCOMP": "Puerto Rico",
+    "GUCOMP": "Guam",
+    "CACOMP": "Canada",
+    "OPERA": "Europe",
+    "ITCOMP": "Italy",
+    "TWCOMP": "Taiwan",
+    "JPCOMP": "Japan",
+    "SVCOMP": "El Salvador",
+    "MYPENINSULAR": "Peninsular Malaysia",
+    "MYEAST": "East Malaysia",
+}
+
+
+def region_label(region: RegionDef) -> str:
+    """Display name for a region, falling back to its code."""
+    return getattr(region, "label", "") or REGION_LABELS.get(region.name, region.name)
+
+
 def _merge_discovered_regions() -> None:
     """Merge regions contributed by source packages into the global maps.
 

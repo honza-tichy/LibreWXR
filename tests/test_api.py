@@ -120,3 +120,93 @@ class TestCoverageTileEndpoint:
         resp = c.get("/v2/coverage/0/256/4/3/5/0/0_0.png")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/png"
+
+
+class TestRadarCoverage:
+    """The per-region health block the app reads to flag stale frames.
+
+    Uses its own store and restores the module globals afterwards — the
+    shared _make_test_app() state is reused by every other class in this
+    file, and mutating it in place produces order-dependent failures.
+    """
+
+    @pytest.fixture
+    def coverage_client(self):
+        import asyncio
+
+        store = FrameStore(max_frames=12)
+        ts = int(time.time() // 600) * 600
+        arr = np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+
+        # t0: both regions fresh.  t1: TWCOMP carried from t0.  t2: TWCOMP
+        # gone entirely (past the lookback), USCOMP still fine.
+        asyncio.run(store.add_frame(RadarFrame(
+            timestamp=ts - 1200, regions={"USCOMP": arr, "TWCOMP": arr},
+        )))
+        asyncio.run(store.add_frame(RadarFrame(
+            timestamp=ts - 600,
+            regions={"USCOMP": arr, "TWCOMP": arr},
+            carried_from={"TWCOMP": ts - 1200},
+        )))
+        asyncio.run(store.add_frame(RadarFrame(
+            timestamp=ts, regions={"USCOMP": arr},
+        )))
+
+        saved_store, saved_regions = routes.frame_store, routes.enabled_regions
+        routes.frame_store = store
+        routes.enabled_regions = ["USCOMP", "TWCOMP"]
+        app = FastAPI()
+        app.include_router(routes.router)
+        try:
+            with TestClient(app, raise_server_exceptions=False) as c:
+                yield c, ts
+        finally:
+            routes.frame_store = saved_store
+            routes.enabled_regions = saved_regions
+
+    def test_lists_enabled_region_footprints(self, coverage_client):
+        c, _ = coverage_client
+        cov = c.get("/public/weather-maps.json").json()["radar"]["coverage"]
+
+        ids = {r["id"] for r in cov["regions"]}
+        assert ids == {"USCOMP", "TWCOMP"}
+        tw = next(r for r in cov["regions"] if r["id"] == "TWCOMP")
+        assert tw["label"] == "Taiwan"
+        assert len(tw["bounds"]) == 4 and tw["px"] > 0
+
+    def test_healthy_region_is_omitted_from_degraded(self, coverage_client):
+        c, _ = coverage_client
+        cov = c.get("/public/weather-maps.json").json()["radar"]["coverage"]
+        assert "USCOMP" not in cov["degraded"]
+
+    def test_carried_and_absent_frames_are_reported(self, coverage_client):
+        c, ts = coverage_client
+        cov = c.get("/public/weather-maps.json").json()["radar"]["coverage"]
+
+        tw = cov["degraded"]["TWCOMP"]
+        assert tw["carried"] == [ts - 600]
+        assert tw["absent"] == [ts]
+        # The age the pill shows comes from here: the last real
+        # observation, NOT the frame the copy was taken from.
+        assert tw["latestObserved"] == ts - 1200
+
+    def test_rainviewer_shape_is_unchanged(self, coverage_client):
+        c, _ = coverage_client
+        body = c.get("/public/weather-maps.json").json()
+
+        assert set(body) >= {"version", "generated", "host", "radar", "satellite"}
+        assert set(body["radar"]) >= {"past", "nowcast", "colorSchemes"}
+        for frame in body["radar"]["past"]:
+            # Frames stay exactly {time, path}: coverage is keyed by
+            # region, not smeared across every timestamp.
+            assert set(frame) == {"time", "path"}
+
+    def test_health_reports_region_freshness(self, coverage_client):
+        c, ts = coverage_client
+        frames = c.get("/health").json()["frames"]
+
+        tw = frames["per_region_status"]["TWCOMP"]
+        assert (tw["fresh"], tw["carried"], tw["absent"]) == (1, 1, 1)
+        assert tw["latest_observed"] == ts - 1200
+        # Presence alone would have said 2 of 3 and looked healthy.
+        assert frames["per_region"]["TWCOMP"] == 2

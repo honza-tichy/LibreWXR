@@ -15,13 +15,17 @@ from librewxr.api.models import (
     AlertsResponse,
     ColorScheme,
     GeoJSONFeature,
+    RadarCoverage,
     RadarData,
+    RadarRegionInfo,
     RadarTimestamp,
+    RegionCoverage,
     SatelliteData,
     WeatherMapsResponse,
 )
 from librewxr.colors.schemes import SCHEME_NAMES
 from librewxr.config import settings
+from librewxr.data.regions import REGIONS, region_label
 from librewxr.data.store import FrameStore
 from librewxr.memory import detect_memory_limit_mb
 from librewxr.tiles.cache import TileCache
@@ -129,6 +133,40 @@ async def health():
     for name in (enabled_regions or []):
         per_region_counts.setdefault(name, 0)
 
+    # Freshness, not just presence: a region carried forward every cycle
+    # keeps a full frame count while serving data that can be days old.
+    region_status = await frame_store.get_region_status()
+    per_region_status: dict[str, dict] = {}
+    for name in (enabled_regions or []):
+        fresh = carried = absent = 0
+        latest_observed: int | None = None
+        for ts in timestamps:
+            entry = region_status.get(ts, {})
+            if name not in entry:
+                absent += 1
+                continue
+            origin = entry[name]
+            if origin is None:
+                fresh += 1
+                latest_observed = (
+                    ts if latest_observed is None else max(latest_observed, ts)
+                )
+            else:
+                carried += 1
+                latest_observed = (
+                    origin if latest_observed is None
+                    else max(latest_observed, origin)
+                )
+        per_region_status[name] = {
+            "fresh": fresh,
+            "carried": carried,
+            "absent": absent,
+            "latest_observed": latest_observed,
+            "observed_age_seconds": (
+                now - latest_observed if latest_observed else None
+            ),
+        }
+
     # Per-component memory breakdown.  Every NWP grid is iterated from
     # ``nwp_grids``; the per-slug byte counts are folded into both
     # ``tracked_bytes`` and the ``breakdown`` dict below so adding a new
@@ -181,6 +219,7 @@ async def health():
             "oldest": oldest_ts,
             "latest_age_seconds": now - latest_ts if latest_ts else None,
             "per_region": per_region_counts,
+            "per_region_status": per_region_status,
         },
         "tile_cache": {
             "entries": tile_cache.size,
@@ -248,7 +287,7 @@ def _content_type(ext: str) -> str:
     return "image/webp" if ext == "webp" else "image/png"
 
 
-@router.get("/public/weather-maps.json")
+@router.get("/public/weather-maps.json", response_model_exclude_none=True)
 async def weather_maps() -> WeatherMapsResponse:
     """Rain Viewer-compatible metadata endpoint."""
     timestamps = await frame_store.get_timestamps()
@@ -288,9 +327,64 @@ async def weather_maps() -> WeatherMapsResponse:
         version="2.0",
         generated=int(time.time()),
         host=host,
-        radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
+        radar=RadarData(
+            past=past,
+            nowcast=nowcast,
+            colorSchemes=color_schemes,
+            coverage=await _radar_coverage(sorted(timestamps)),
+        ),
         satellite=SatelliteData(infrared=infrared),
     )
+
+
+async def _radar_coverage(timestamps: list[int]) -> RadarCoverage:
+    """Per-region footprint and health for the frames in the index.
+
+    Reads only ``frame_store`` and the module-level ``enabled_regions``
+    — never ``radar_fetcher``, which is None on render workers, and they
+    are the processes that answer this endpoint in a multi-worker
+    deployment.  Anything sourced from the fetcher works in single-worker
+    dev and is permanently empty in production.
+    """
+    status = await frame_store.get_region_status()
+    enabled = list(enabled_regions or REGIONS.keys())
+
+    regions_info = [
+        RadarRegionInfo(
+            id=r.name,
+            label=region_label(r),
+            bounds=[r.west, r.south, r.east, r.north],
+            px=r.pixel_size,
+        )
+        for name in enabled
+        if (r := REGIONS.get(name)) is not None
+    ]
+
+    degraded: dict[str, RegionCoverage] = {}
+    for name in enabled:
+        carried: list[int] = []
+        absent: list[int] = []
+        latest: int | None = None
+        for ts in timestamps:
+            entry = status.get(ts, {})
+            if name not in entry:
+                # Not in the frame at all.  Derived rather than recorded,
+                # which is what catches regions that no code path touched
+                # — e.g. a second priority wave the cycle budget dropped.
+                absent.append(ts)
+                continue
+            origin = entry[name]
+            if origin is None:
+                latest = ts if latest is None else max(latest, ts)
+            else:
+                carried.append(ts)
+                latest = origin if latest is None else max(latest, origin)
+        if carried or absent:
+            degraded[name] = RegionCoverage(
+                carried=carried, absent=absent, latestObserved=latest,
+            )
+
+    return RadarCoverage(regions=regions_info, degraded=degraded)
 
 
 @router.get("/v2/radar/{timestamp}/{size}/{z}/{x}/{y}/{color}/{smooth_snow}.{ext}")
