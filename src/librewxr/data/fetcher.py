@@ -313,7 +313,27 @@ class RadarFetcher:
             nowcast_s = 0.0
             cells_s = 0.0
             try:
-                await self._fetch_all_frames()
+                try:
+                    # Bound the fetch stage, not the whole cycle: nowcast
+                    # and the state snapshot below must still run on
+                    # whatever frames landed, or abandoning a slow cycle
+                    # would cost the very frame it was trying to save.
+                    await asyncio.wait_for(
+                        self._fetch_all_frames(),
+                        timeout=settings.fetch_cycle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # The per-source deadlines missed this one: a cycle is
+                    # a sum, and enough merely-slow sources overrun the
+                    # boundary without any single one tripping its own
+                    # limit.  Publishing late is worse than publishing
+                    # partial — a skipped boundary is a missing frame.
+                    logger.warning(
+                        "fetch stage exceeded its %.0fs budget — abandoned, "
+                        "publishing what landed so the next boundary is not "
+                        "skipped",
+                        settings.fetch_cycle_timeout,
+                    )
                 _nc_start = time.monotonic()
                 await self._run_nowcast()
                 nowcast_s = time.monotonic() - _nc_start
@@ -472,6 +492,13 @@ class RadarFetcher:
             # succeeded, the NWP exception re-raises exactly as the old
             # sequential await did.
             radar_exc = sys.exc_info()[0]
+            # Cancelled from outside (shutdown, or the fetch_cycle_timeout
+            # budget in the fetch loop): take the concurrent NWP stage down
+            # too.  Awaiting it instead would hold the cancelled fetch open
+            # until the slowest grid finished — exactly the overrun the
+            # budget exists to cut short.
+            if radar_exc is not None and issubclass(radar_exc, asyncio.CancelledError):
+                nwp_task.cancel()
             try:
                 await nwp_task
             except Exception:
@@ -723,6 +750,13 @@ class RadarFetcher:
             # succeeded, the NWP exception re-raises exactly as the old
             # sequential await did.
             radar_exc = sys.exc_info()[0]
+            # Cancelled from outside (shutdown, or the fetch_cycle_timeout
+            # budget in the fetch loop): take the concurrent NWP stage down
+            # too.  Awaiting it instead would hold the cancelled fetch open
+            # until the slowest grid finished — exactly the overrun the
+            # budget exists to cut short.
+            if radar_exc is not None and issubclass(radar_exc, asyncio.CancelledError):
+                nwp_task.cancel()
             try:
                 await nwp_task
             except Exception:
