@@ -1018,6 +1018,23 @@ Per-source HTTP timeouts do not bound this on their own. They are set per upstre
 
 120 s is roughly 10x a healthy region fetch. Raise it for a legitimately slow upstream you would rather wait for than lose; lower it if you would rather drop a region than let cycles drift toward the boundary.
 
+### `LIBREWXR_FETCH_CYCLE_TIMEOUT`
+
+Budget in seconds for the fetch stage of one cycle — the backstop behind the two per-source deadlines above. On expiry the stage is abandoned, logged at WARNING, and the cycle still publishes whatever landed.
+
+| | |
+|---|---|
+| **Default** | `540` |
+| **Type** | float (seconds) |
+
+The fetch loop sleeps until the next clock-aligned boundary, so cycles never overlap — a cycle that runs long **skips** the next boundary instead, and a skipped boundary is a missing frame. Enough of them age the newest frame past any external staleness monitor.
+
+Per-source deadlines cannot prevent this, because a cycle is a sum rather than a single wait. With `LIBREWXR_NWP_FETCH_CONCURRENCY=4` and thirteen grids enabled, the auxiliary stage runs four sequential batches; several merely-slow sources reached 6.5 minutes in production without any one of them approaching `LIBREWXR_NWP_FETCH_TIMEOUT`.
+
+Only the fetch stage is bounded. Nowcast generation and the state snapshot run either way, so abandoning a slow cycle costs some regions in that frame rather than the frame itself. The initial backfill is deliberately exempt — it fetches the whole history window and legitimately runs for minutes.
+
+Must stay below `LIBREWXR_FETCH_INTERVAL` (default 600 s), or it cannot protect the boundary it exists to protect. 540 s leaves room for the nowcast tail.
+
 ---
 
 ## Nowcasting

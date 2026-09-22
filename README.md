@@ -431,6 +431,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_NWP_FETCH_CONCURRENCY` | `4` | Max parallel NWP grid fetches per cycle |
 | `LIBREWXR_NWP_FETCH_TIMEOUT` | `300` | Deadline (s) per NWP grid fetch — the cycle gates radar on the slowest grid, so this bounds radar staleness too |
 | `LIBREWXR_RADAR_FETCH_TIMEOUT` | `120` | Deadline (s) per region radar fetch — keeps one degraded upstream from setting the whole cycle's wall time |
+| `LIBREWXR_FETCH_CYCLE_TIMEOUT` | `540` | Budget (s) for a cycle's fetch stage — abandons an overrunning cycle so it cannot skip the next frame boundary |
 | **Nowcast** | | |
 | `LIBREWXR_NOWCAST_ENABLED` | `true` | Enable experimental precipitation nowcast |
 | `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames (6 × 10 min = 60 min forecast) |

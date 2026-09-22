@@ -433,6 +433,26 @@ class Settings(BaseSettings):
     # absent from this frame and retried next cycle — one stale region
     # instead of a stale map.
     radar_fetch_timeout: float = 120.0
+    # Budget for the fetch stage of one cycle, as a last line of defence
+    # behind the two per-source deadlines above.
+    #
+    # The loop sleeps to the next clock-aligned boundary, so cycles never
+    # overlap — a long one *skips* the boundary instead.  That is the
+    # failure that matters: skipped boundaries are missing frames, and
+    # enough of them age the newest frame past any external staleness
+    # monitor.  Per-source deadlines cannot prevent it on their own,
+    # because a cycle is a sum: with nwp_fetch_concurrency=4 and 13
+    # grids, four batches of merely-slow sources reached 6.5 min on
+    # 2026-09-22 without one of them going near nwp_fetch_timeout.
+    #
+    # On expiry the stage is abandoned and the cycle still publishes
+    # whatever landed — nowcast and the state snapshot run either way —
+    # so the cost is some missing regions, not a missing frame.
+    #
+    # Must stay below fetch_interval (600 s) or it cannot protect the
+    # boundary it exists to protect.  540 s leaves room for the nowcast
+    # tail.
+    fetch_cycle_timeout: float = 540.0
     cors_origins: list[str] = ["*"]
 
     @field_validator("mode", mode="before")

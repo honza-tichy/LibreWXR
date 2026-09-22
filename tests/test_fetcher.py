@@ -834,3 +834,106 @@ class TestRadarFetchDeadline:
         frame = await store.get_frame(1000)
         assert frame is not None and "TWCOMP" in frame.regions
         assert not any("timed out" in r.message for r in caplog.records)
+
+
+class TestFetchCycleBudget:
+    """A cycle that overruns must be abandoned, not allowed to skip a boundary.
+
+    The loop sleeps to the next clock-aligned boundary, so a cycle that
+    runs past it does not overlap the next one — it *skips* it, and a
+    skipped boundary is a missing frame.  Per-source deadlines cannot
+    prevent this: a cycle is a sum, and on 2026-09-22 four batches of
+    merely-slow NWP grids reached 6.5 min without one of them going near
+    nwp_fetch_timeout.
+    """
+
+    @pytest.fixture
+    def region(self):
+        return RegionDef(
+            name="TESTREG",
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="TEST",
+            grid_width=32, grid_height=32,
+        )
+
+    def _fetcher(self, region):
+        fetcher, _ = _build_fetcher(
+            FrameStore(max_frames=8), TileCache(max_mb=1), None, region,
+        )
+        return fetcher
+
+    @pytest.mark.asyncio
+    async def test_overrunning_fetch_is_abandoned(
+        self, region, monkeypatch, caplog
+    ):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "fetch_cycle_timeout", 0.05)
+        monkeypatch.setattr(settings, "fetch_interval", 1)
+        fetcher = self._fetcher(region)
+
+        # The initial backfill is deliberately NOT bounded — it fetches
+        # the whole history window and legitimately runs for minutes — so
+        # the stub must clear it before the loop's budget can be tested.
+        calls = {"n": 0}
+
+        async def slow_fetch():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return
+            await asyncio.sleep(30)
+
+        ran: list[str] = []
+
+        async def note_nowcast():
+            ran.append("nowcast")
+
+        monkeypatch.setattr(fetcher, "_fetch_all_frames", slow_fetch)
+        monkeypatch.setattr(fetcher, "_run_nowcast", note_nowcast)
+        monkeypatch.setattr(fetcher, "_schedule_warm", lambda: None)
+
+        task = asyncio.create_task(fetcher._backfill_then_loop())
+        with caplog.at_level("WARNING"):
+            await asyncio.sleep(1.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert any("exceeded its" in r.message for r in caplog.records)
+        # The point of bounding the fetch stage and not the whole cycle:
+        # what landed is still published.
+        assert "nowcast" in ran
+
+    @pytest.mark.asyncio
+    async def test_fast_cycle_is_untouched(self, region, monkeypatch, caplog):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "fetch_cycle_timeout", 30.0)
+        monkeypatch.setattr(settings, "fetch_interval", 1)
+        fetcher = self._fetcher(region)
+
+        calls: list[str] = []
+
+        async def quick_fetch():
+            calls.append("fetch")
+
+        async def quick_nowcast():
+            calls.append("nowcast")
+
+        monkeypatch.setattr(fetcher, "_fetch_all_frames", quick_fetch)
+        monkeypatch.setattr(fetcher, "_run_nowcast", quick_nowcast)
+        monkeypatch.setattr(fetcher, "_schedule_warm", lambda: None)
+
+        task = asyncio.create_task(fetcher._backfill_then_loop())
+        with caplog.at_level("WARNING"):
+            await asyncio.sleep(1.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert calls.count("fetch") >= 1
+        assert not any("exceeded its" in r.message for r in caplog.records)

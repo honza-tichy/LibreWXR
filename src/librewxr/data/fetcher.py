@@ -242,7 +242,27 @@ class RadarFetcher:
             ).strftime("%Y-%m-%d %H:%M UTC")
             logger.info("─── fetch cycle start (boundary %s) ───", boundary_iso)
             try:
-                await self._fetch_all_frames()
+                try:
+                    # Bound the fetch stage, not the whole cycle: nowcast
+                    # and the state snapshot below must still run on
+                    # whatever frames landed, or abandoning a slow cycle
+                    # would cost the very frame it was trying to save.
+                    await asyncio.wait_for(
+                        self._fetch_all_frames(),
+                        timeout=settings.fetch_cycle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # The per-source deadlines missed this one: a cycle is
+                    # a sum, and enough merely-slow sources overrun the
+                    # boundary without any single one tripping its own
+                    # limit.  Publishing late is worse than publishing
+                    # partial — a skipped boundary is a missing frame.
+                    logger.warning(
+                        "fetch stage exceeded its %.0fs budget — abandoned, "
+                        "publishing what landed so the next boundary is not "
+                        "skipped",
+                        settings.fetch_cycle_timeout,
+                    )
                 await self._run_nowcast()
                 await self._fire_cycle_complete()
                 self._schedule_warm()
