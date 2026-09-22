@@ -170,8 +170,23 @@ class RadarFetcher:
         the server can start serving tiles within seconds.  Historical
         frames are backfilled in a background task.
         """
-        region_names = [r.name for r in self._enabled_regions]
-        logger.info("Fetching regions: %s", ", ".join(region_names))
+        # Print the waves, not the enabled list: with priority waves in
+        # play the enabled list is discovery order, which contradicts the
+        # order regions are actually fetched in — and this line is the
+        # first place anyone looks to check that ordering.
+        waves = self._region_waves()
+        if len(waves) > 1:
+            logger.info(
+                "Fetching regions: %s",
+                " then ".join(
+                    "[" + ", ".join(r.name for r in wave) + "]" for wave in waves
+                ),
+            )
+        else:
+            logger.info(
+                "Fetching regions: %s",
+                ", ".join(r.name for r in waves[0]),
+            )
         await self._fetch_initial()
         self._task = asyncio.create_task(self._backfill_then_loop())
         logger.info("Radar fetcher started (backfill running in background)")

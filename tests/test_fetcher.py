@@ -1035,3 +1035,72 @@ class TestRegionPriorityWaves:
         fetcher._enabled_regions = [twcomp, uscomp]
 
         assert len(fetcher._region_waves()) == 1
+
+    @pytest.mark.asyncio
+    async def test_startup_log_prints_the_waves(self, monkeypatch, caplog):
+        """The line everyone checks must match the order actually used."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", "US,EUROPE")
+
+        uscomp = self._region("USCOMP", "US")
+        opera = self._region("OPERA", "EUROPE")
+        twcomp = self._region("TWCOMP", "TAIWAN")
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, uscomp)
+        fetcher._enabled_regions = [twcomp, opera, uscomp]
+        fetcher._sources = {
+            r.name: _FakeSource() for r in fetcher._enabled_regions
+        }
+
+        async def noop():
+            return None
+
+        monkeypatch.setattr(fetcher, "_fetch_initial", noop)
+        monkeypatch.setattr(fetcher, "_backfill_then_loop", noop)
+
+        with caplog.at_level("INFO"):
+            await fetcher.start()
+        # Not stop(): _FakeSource has no close(), and the loop task is
+        # the only thing start() leaves behind that needs cleaning up.
+        fetcher._task.cancel()
+
+        line = next(
+            r.getMessage() for r in caplog.records
+            if "Fetching regions" in r.getMessage()
+        )
+        assert line == "Fetching regions: [OPERA, USCOMP] then [TWCOMP]"
+
+    @pytest.mark.asyncio
+    async def test_startup_log_is_a_flat_list_with_one_wave(
+        self, monkeypatch, caplog
+    ):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", "")
+
+        uscomp = self._region("USCOMP", "US")
+        twcomp = self._region("TWCOMP", "TAIWAN")
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, uscomp)
+        fetcher._enabled_regions = [twcomp, uscomp]
+
+        async def noop():
+            return None
+
+        monkeypatch.setattr(fetcher, "_fetch_initial", noop)
+        monkeypatch.setattr(fetcher, "_backfill_then_loop", noop)
+
+        with caplog.at_level("INFO"):
+            await fetcher.start()
+        # Not stop(): _FakeSource has no close(), and the loop task is
+        # the only thing start() leaves behind that needs cleaning up.
+        fetcher._task.cancel()
+
+        line = next(
+            r.getMessage() for r in caplog.records
+            if "Fetching regions" in r.getMessage()
+        )
+        assert line == "Fetching regions: TWCOMP, USCOMP"
