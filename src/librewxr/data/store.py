@@ -17,6 +17,27 @@ logger = logging.getLogger(__name__)
 class RadarFrame:
     timestamp: int  # Unix timestamp
     regions: dict[str, np.ndarray] = field(default_factory=dict)
+    # region name -> unix timestamp of the observation the array in
+    # ``regions`` actually came from.  Present ONLY when that differs
+    # from ``timestamp``, i.e. the region was carried forward by the
+    # pass in data/fetcher.py.
+    #
+    # The three states a client cares about are read off this plus
+    # ``regions``, and only ONE of them is ever written:
+    #
+    #   fresh    - name in regions, no carried_from entry
+    #   carried  - name in regions, carried_from[name] = origin
+    #   absent   - name not in regions at all
+    #
+    # Deriving "absent" rather than writing it is deliberate.  A region
+    # can go missing down paths that never reach a writer at all — most
+    # sharply when fetch_cycle_timeout abandons the second priority wave,
+    # so that wave's regions are touched by no code that cycle.  Anything
+    # stamped by a writer would call those fresh.
+    #
+    # Empty is also the right reading of every frame written before this
+    # field existed, in memory, on disk or in state.json.
+    carried_from: dict[str, int] = field(default_factory=dict)
 
 
 class FrameStore:
@@ -91,6 +112,19 @@ class FrameStore:
             for existing in self._frames:
                 if existing.timestamp == frame.timestamp:
                     existing.regions.update(frame.regions)
+                    # Provenance merges here too, and the order matters.
+                    # This pass supplied these regions, so an earlier
+                    # pass's verdict on them is out of date — drop it
+                    # first, so a region that arrives FRESH now loses the
+                    # carried mark it picked up before.  Without this a
+                    # successful re-fetch keeps reporting stale forever.
+                    for name in frame.regions:
+                        existing.carried_from.pop(name, None)
+                    # Then this pass's own marks, so a region carried in
+                    # THIS batch keeps its origin.  Scoping the pop to
+                    # frame.regions is what keeps the second priority
+                    # wave from disturbing the first wave's entries.
+                    existing.carried_from.update(frame.carried_from)
                     return None, True
 
             evicted_ts = None
@@ -122,6 +156,24 @@ class FrameStore:
         """Return a mapping of timestamp -> set of region names present."""
         async with self._lock:
             return {f.timestamp: set(f.regions.keys()) for f in self._frames}
+
+    async def get_region_status(self) -> dict[int, dict[str, int | None]]:
+        """Return timestamp -> {region present in that frame: origin | None}.
+
+        ``None`` means the region was observed at the frame's own
+        timestamp (fresh); an int is the timestamp of the observation the
+        data really came from (carried).  A region missing from the inner
+        dict was absent from that frame entirely — callers derive that by
+        comparing against the enabled-region list, which is the only way
+        to catch regions no code path touched at all.
+        """
+        async with self._lock:
+            return {
+                f.timestamp: {
+                    name: f.carried_from.get(name) for name in f.regions
+                }
+                for f in self._frames
+            }
 
     async def frame_count(self) -> int:
         async with self._lock:
@@ -160,6 +212,11 @@ class FrameStore:
                         ]
                         for name, arr in f.regions.items()
                     },
+                    # The only channel per-region provenance has to the
+                    # render workers: they answer weather-maps.json but
+                    # never run a fetcher, so anything kept as fetcher
+                    # state is invisible to them.
+                    "carried_from": dict(f.carried_from),
                 }
                 for f in self._frames
             ],
@@ -179,7 +236,14 @@ class FrameStore:
         memmap_dir = Path(state["memmap_dir"])
         new_frames: list[RadarFrame] = []
         for f_info in state["frames"]:
-            frame = RadarFrame(timestamp=f_info["timestamp"])
+            frame = RadarFrame(
+                timestamp=f_info["timestamp"],
+                # Absent in snapshots written before this field existed;
+                # empty is correct there — nothing was known to be stale.
+                carried_from={
+                    k: int(v) for k, v in (f_info.get("carried_from") or {}).items()
+                },
+            )
             for name, (basename, dtype_str, shape) in f_info["regions"].items():
                 frame.regions[name] = np.memmap(
                     memmap_dir / basename,

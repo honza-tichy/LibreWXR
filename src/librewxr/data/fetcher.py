@@ -46,11 +46,24 @@ class RadarFetcher:
     # most recent prior frame in the store rather than leaving the region
     # absent (which causes the renderer to fall through to NWP fill, a
     # jarring visual flicker for what's usually a transient upstream
-    # blip).  Bounded staleness: a region absent for more than this many
-    # consecutive fetch intervals drops out instead of carrying forward
-    # indefinitely.  At 10-min cadence, 2 intervals = up to 20 min of
-    # stale data — enough to bridge typical publication delays without
-    # masking a genuine multi-cycle outage.
+    # blip).
+    #
+    # This bounds how far back the carry-forward pass LOOKS for a donor
+    # frame.  It does NOT bound how old carried data can get, though the
+    # comment here claimed it did until 2026-09-22.  A carried region is
+    # present in its frame, so (1) `get_region_keys` reports that ts as
+    # complete and it is never re-fetched, and (2) the next cycle finds
+    # the carried copy one interval back and carries it again.  The chain
+    # advances a step per cycle for as long as the source stays down —
+    # observed in production as radar frozen over Taiwan for days while
+    # every frame looked current.
+    #
+    # Adding a real bound is one condition in that loop now that the
+    # origin timestamp is recorded (`RadarFrame.carried_from`):
+    #     if ts - origin <= self._CARRY_FORWARD_MAX_INTERVALS * interval
+    # It is deliberately NOT added here — dropping the region instead
+    # means falling through to NWP fill, which is a visible behaviour
+    # change and a separate decision from reporting the staleness.
     _CARRY_FORWARD_MAX_INTERVALS = 2
 
     def __init__(
@@ -693,6 +706,10 @@ class RadarFetcher:
             # later can't invalidate the carried data.
             already_have = (skip_regions or {}).get(ts, set())
             missing = enabled_names - set(regions_data.keys()) - already_have
+            # Provenance for the regions this pass carries forward.  A
+            # fresh region gets no entry, and an absent one is derived
+            # from its absence in ``regions`` — see RadarFrame.
+            carried_map: dict[str, int] = {}
             for lookback in range(1, self._CARRY_FORWARD_MAX_INTERVALS + 1):
                 if not missing:
                     break
@@ -705,10 +722,21 @@ class RadarFetcher:
                         regions_data[name] = np.asarray(
                             prev_frame.regions[name]
                         ).copy()
-                        stale_min = (lookback * interval) // 60
+                        # Chase the chain to the ORIGINAL observation.
+                        # prev_frame's copy may itself have been carried:
+                        # _CARRY_FORWARD_MAX_INTERVALS bounds how far back
+                        # this loop LOOKS, not how long a region can keep
+                        # being carried, and a carried region counts as
+                        # present so its ts is never re-fetched.  prev_ts
+                        # therefore understates the real age, by days
+                        # during a sustained outage.
+                        origin = prev_frame.carried_from.get(name, prev_ts)
+                        carried_map[name] = origin
+                        stale_min = (ts - origin) // 60
                         logger.info(
-                            "%s: carry-forward into ts=%d from %d (%d min stale)",
-                            name, ts, prev_ts, stale_min,
+                            "%s: carry-forward into ts=%d from %d "
+                            "(observed %d, %d min stale)",
+                            name, ts, prev_ts, origin, stale_min,
                         )
                         missing.discard(name)
 
@@ -718,7 +746,9 @@ class RadarFetcher:
                 # source.  Skip the empty-frame write entirely.
                 continue
 
-            frame = RadarFrame(timestamp=ts, regions=regions_data)
+            frame = RadarFrame(
+                timestamp=ts, regions=regions_data, carried_from=carried_map,
+            )
             evicted_ts, merged = await self._store.add_frame(frame)
             if evicted_ts is not None:
                 self._cache.invalidate_timestamp(evicted_ts)
@@ -746,7 +776,17 @@ class RadarFetcher:
                 active_ts = await self._store.get_timestamps()
                 self._radar_cache.cleanup(active_ts)
                 regions_by_name = {r.name: r for r in self._enabled_regions}
-                self._radar_cache.save_metadata(regions_by_name, active_ts)
+                # Carry provenance across restarts too: without it a
+                # restart reloads carried arrays and reports them fresh,
+                # which is the same lie in a new place.
+                status = await self._store.get_region_status()
+                carried = {
+                    ts_: {n: o for n, o in entry.items() if o is not None}
+                    for ts_, entry in status.items()
+                }
+                self._radar_cache.save_metadata(
+                    regions_by_name, active_ts, carried,
+                )
             except Exception:
                 logger.exception("Failed to update radar cache metadata")
 

@@ -48,6 +48,51 @@ class TestRadarFrameCache:
         np.testing.assert_array_equal(loaded[0].regions["AKCOMP"],
                                       frame.regions["AKCOMP"])
 
+    def test_carried_from_survives_the_round_trip(self, tmp_path):
+        """A restart must not promote carried data back to "fresh"."""
+        cache = RadarFrameCache(tmp_path)
+        regions = {"USCOMP": FakeRegion(10, 20), "AKCOMP": FakeRegion(5, 8)}
+
+        cache.write_frame(_make_frame(1000, {"USCOMP": (10, 20), "AKCOMP": (5, 8)}))
+        cache.save_metadata(regions, [1000], {1000: {"AKCOMP": 400}})
+
+        loaded = cache.load_frames(regions)
+        assert loaded[0].carried_from == {"AKCOMP": 400}
+
+    def test_metadata_without_carried_from_still_loads_frames(self, tmp_path):
+        """Upgrade path, and the reason SCHEMA_VERSION is not bumped.
+
+        A bump makes load_frames return nothing on mismatch, which would
+        throw away the whole cached window and cold-start the pipeline on
+        deploy.  Old metadata must simply read as all-fresh.
+        """
+        cache = RadarFrameCache(tmp_path)
+        regions = {"USCOMP": FakeRegion(10, 20)}
+
+        cache.write_frame(_make_frame(1000, {"USCOMP": (10, 20)}))
+        cache.save_metadata(regions, [1000])  # two-arg, as before this change
+
+        meta = json.loads((tmp_path / "radar" / "metadata.json").read_text())
+        del meta["carried_from"]
+        (tmp_path / "radar" / "metadata.json").write_text(json.dumps(meta))
+
+        loaded = cache.load_frames(regions)
+        assert len(loaded) == 1
+        assert loaded[0].carried_from == {}
+
+    def test_carried_from_dropped_for_regions_that_fail_validation(
+        self, tmp_path,
+    ):
+        """Provenance must not outlive the array it describes."""
+        cache = RadarFrameCache(tmp_path)
+        old_regions = {"USCOMP": FakeRegion(10, 20)}
+        cache.write_frame(_make_frame(1000, {"USCOMP": (10, 20)}))
+        cache.save_metadata(old_regions, [1000], {1000: {"USCOMP": 400}})
+
+        # Region reshaped in code — the cached file is dropped on load.
+        loaded = cache.load_frames({"USCOMP": FakeRegion(11, 21)})
+        assert loaded == [] or "USCOMP" not in loaded[0].carried_from
+
     def test_schema_version_mismatch_invalidates_cache(self, tmp_path):
         cache = RadarFrameCache(tmp_path)
         regions = {"USCOMP": FakeRegion(10, 20)}

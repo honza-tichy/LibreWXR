@@ -58,6 +58,57 @@ class TestFrameStorePersistence:
         assert "REGA" in frame.regions
         np.testing.assert_array_equal(frame.regions["REGA"], arr)
 
+    @pytest.mark.asyncio
+    async def test_roundtrip_preserves_carried_from(self, tmp_path: Path) -> None:
+        """Provenance must survive the fetcher -> render-worker hop.
+
+        Render workers answer weather-maps.json and never run a fetcher,
+        so state.json is the only channel this can travel down.  Lose it
+        here and the feature works in single-worker dev and is
+        permanently empty in production.
+        """
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=4, cache_dir=cache)
+        arr = np.full((10, 20), 42, dtype=np.uint8)
+        await producer.add_frame(RadarFrame(
+            timestamp=1700000600,
+            regions={"REGA": arr, "REGB": arr},
+            carried_from={"REGB": 1700000000},
+        ))
+
+        consumer = FrameStore(max_frames=4)
+        consumer.__setstate__(_roundtrip(producer.__getstate__()))
+
+        frame = await consumer.get_frame(1700000600)
+        assert frame.carried_from == {"REGB": 1700000000}
+
+    @pytest.mark.asyncio
+    async def test_setstate_without_carried_from_loads_as_fresh(
+        self, tmp_path: Path,
+    ) -> None:
+        """The upgrade path: a snapshot from the previous release.
+
+        Without the default, the first rolling restart after deploy
+        KeyErrors on every render worker.
+        """
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=4, cache_dir=cache)
+        arr = np.full((10, 20), 7, dtype=np.uint8)
+        await producer.add_frame(
+            RadarFrame(timestamp=1700000000, regions={"REGA": arr}),
+        )
+
+        snapshot = _roundtrip(producer.__getstate__())
+        for f_info in snapshot["frames"]:
+            del f_info["carried_from"]
+
+        consumer = FrameStore(max_frames=4)
+        consumer.__setstate__(snapshot)
+
+        frame = await consumer.get_frame(1700000000)
+        assert frame is not None
+        assert frame.carried_from == {}
+
     def test_cache_dir_is_persistent(self, tmp_path: Path) -> None:
         store = FrameStore(cache_dir=tmp_path)
         assert store._persistent is True

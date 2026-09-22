@@ -100,6 +100,10 @@ class RadarFrameCache:
             )
         timestamps = sorted(metadata_timestamps | disk_timestamps)
 
+        # Absent in metadata written before this key existed; empty then
+        # means "nothing known to be carried", which is the right reading.
+        carried_meta = meta.get("carried_from", {}) or {}
+
         frames: list[RadarFrame] = []
         for ts in timestamps:
             regions_data: dict[str, np.ndarray] = {}
@@ -119,7 +123,19 @@ class RadarFrameCache:
                 if arr is not None:
                     regions_data[name] = arr
             if regions_data:
-                frames.append(RadarFrame(timestamp=ts, regions=regions_data))
+                # Filter to regions that actually survived shape
+                # validation above — provenance for a dropped region
+                # would describe an array that is not there.
+                entry = carried_meta.get(str(ts), {})
+                frames.append(RadarFrame(
+                    timestamp=ts,
+                    regions=regions_data,
+                    carried_from={
+                        name: int(origin)
+                        for name, origin in entry.items()
+                        if name in regions_data
+                    },
+                ))
         return frames
 
     def _scan_timestamps(self) -> set[int]:
@@ -148,9 +164,23 @@ class RadarFrameCache:
             return None
 
     def save_metadata(
-        self, regions: dict[str, RegionDef], timestamps: list[int]
+        self,
+        regions: dict[str, RegionDef],
+        timestamps: list[int],
+        carried_from: dict[int, dict[str, int]] | None = None,
     ) -> None:
-        """Atomically write metadata JSON with current shapes and timestamps."""
+        """Atomically write metadata JSON with current shapes and timestamps.
+
+        ``carried_from`` records which cached regions are carry-forward
+        copies and of what, so a restart does not silently promote stale
+        data back to "fresh".  Optional, and SCHEMA_VERSION is
+        deliberately NOT bumped for it: ``load_frames`` treats a version
+        mismatch as fatal and returns nothing, so a bump would throw away
+        the whole cached window on upgrade and cold-start the pipeline —
+        a real outage in exchange for a version number.  The change is
+        additive both ways: new code reading old metadata sees no key and
+        reads it as all-fresh, old code ignores the key it doesn't know.
+        """
         payload = {
             "schema_version": SCHEMA_VERSION,
             "regions": {
@@ -158,6 +188,13 @@ class RadarFrameCache:
                 for name, r in regions.items()
             },
             "timestamps": sorted(timestamps),
+            # Sparse — only regions actually carried appear.  JSON object
+            # keys must be strings, hence str(ts).
+            "carried_from": {
+                str(ts): entry
+                for ts, entry in (carried_from or {}).items()
+                if entry
+            },
         }
         tmp = self._metadata_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))

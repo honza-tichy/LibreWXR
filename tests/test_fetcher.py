@@ -1104,3 +1104,181 @@ class TestRegionPriorityWaves:
             if "Fetching regions" in r.getMessage()
         )
         assert line == "Fetching regions: TWCOMP, USCOMP"
+
+
+class TestCarryForwardProvenance:
+    """Carried regions must say which observation they really came from.
+
+    A carried region is present in its frame, so get_region_keys reports
+    that timestamp as complete and it is never re-fetched, and the next
+    cycle carries the already-carried copy forward again.
+    _CARRY_FORWARD_MAX_INTERVALS bounds the lookback, not the chain — so
+    the lookback distance understates the real age, by days during a
+    sustained outage (Taiwan/CWA, 2026-09-21 onward). Recording the
+    origin is what lets clients report an honest age.
+    """
+
+    @pytest.fixture
+    def small_region(self):
+        return RegionDef(
+            name="TESTREG",
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="US",
+            grid_width=32, grid_height=32,
+        )
+
+    @pytest.mark.asyncio
+    async def test_carry_forward_records_the_origin(self, small_region):
+        from librewxr.config import settings
+        interval = settings.fetch_interval
+
+        store = FrameStore(max_frames=8)
+        fetcher, source = _build_fetcher(
+            store, TileCache(max_mb=1), None, small_region,
+        )
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        source.next_return = None
+        await fetcher._fetch_timestamps([(1000 + interval, "live", 10)])
+
+        frame = await store.get_frame(1000 + interval)
+        assert frame.carried_from == {"TESTREG": 1000}
+
+    @pytest.mark.asyncio
+    async def test_chain_reports_the_original_not_the_previous_frame(
+        self, small_region,
+    ):
+        """The regression that matters: a carried copy carried again.
+
+        Without chasing the chain, each frame would claim its data came
+        from one interval back and look 10 minutes old forever, however
+        long the source has actually been down.
+        """
+        from librewxr.config import settings
+        interval = settings.fetch_interval
+
+        store = FrameStore(max_frames=8)
+        fetcher, source = _build_fetcher(
+            store, TileCache(max_mb=1), None, small_region,
+        )
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        for step in (1, 2, 3):
+            source.next_return = None
+            await fetcher._fetch_timestamps(
+                [(1000 + step * interval, "live", 10 * step)],
+            )
+
+        frame = await store.get_frame(1000 + 3 * interval)
+        assert frame.carried_from == {"TESTREG": 1000}, (
+            "origin must chase back to the real observation, not stop at "
+            "the previous (itself carried) frame"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_region_records_nothing(self, small_region):
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(
+            store, TileCache(max_mb=1), None, small_region,
+        )
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+
+        assert (await store.get_frame(1000)).carried_from == {}
+
+    @pytest.mark.asyncio
+    async def test_absent_region_is_derived_not_recorded(self, small_region):
+        """Past the lookback limit the region drops, with no entry at all.
+
+        "Absent" is read off the missing key in ``regions``, never
+        written — which is what makes it correct for regions no code path
+        touched, such as a priority wave the cycle budget abandoned.
+        """
+        from librewxr.config import settings
+        interval = settings.fetch_interval
+
+        store = FrameStore(max_frames=8)
+        fetcher, source = _build_fetcher(
+            store, TileCache(max_mb=1), None, small_region,
+        )
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        far = 1000 + (fetcher._CARRY_FORWARD_MAX_INTERVALS + 1) * interval
+        source.next_return = None
+        await fetcher._fetch_timestamps([(far, "live", 30)])
+
+        frame = await store.get_frame(far)
+        assert frame is None or "TESTREG" not in frame.regions
+        if frame is not None:
+            assert "TESTREG" not in frame.carried_from
+
+    @pytest.mark.asyncio
+    async def test_fresh_refetch_clears_the_carried_mark(self, small_region):
+        """A region that comes back must stop being reported stale.
+
+        This is the add_frame merge path: without the pop, a successful
+        re-fetch merges into the existing frame and the old mark survives
+        forever.
+        """
+        from librewxr.config import settings
+        interval = settings.fetch_interval
+        ts = 1000 + interval
+
+        store = FrameStore(max_frames=8)
+        fetcher, source = _build_fetcher(
+            store, TileCache(max_mb=1), None, small_region,
+        )
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        source.next_return = None
+        await fetcher._fetch_timestamps([(ts, "live", 10)])
+        assert (await store.get_frame(ts)).carried_from == {"TESTREG": 1000}
+
+        # Now the source recovers and the same ts is fetched again.
+        source.fill_value = 42
+        await fetcher._fetch_timestamps([(ts, "live", 10)])
+
+        frame = await store.get_frame(ts)
+        assert frame.regions["TESTREG"][0, 0] == 42
+        assert frame.carried_from == {}
+
+    @pytest.mark.asyncio
+    async def test_second_wave_does_not_disturb_the_first(self, monkeypatch):
+        """Two waves, one timestamp, disjoint regions — marks must not cross.
+
+        _fetch_regions_for_timestamps runs once per priority wave and
+        both merge into the same frame, so the merge's pop has to be
+        scoped to the regions the wave actually supplied.
+        """
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", "US")
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
+        interval = settings.fetch_interval
+
+        us = RegionDef(
+            name="USCOMP", west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="US", grid_width=32, grid_height=32,
+        )
+        tw = RegionDef(
+            name="TWCOMP", west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group="TAIWAN", grid_width=32, grid_height=32,
+        )
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, us)
+        fetcher._enabled_regions = [us, tw]
+        us_src, tw_src = _FakeSource(fill_value=10), _FakeSource(fill_value=20)
+        fetcher._sources = {"USCOMP": us_src, "TWCOMP": tw_src}
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+
+        # Taiwan drops; the US stays healthy.
+        tw_src.next_return = None
+        await fetcher._fetch_timestamps([(1000 + interval, "live", 10)])
+
+        frame = await store.get_frame(1000 + interval)
+        assert frame.carried_from == {"TWCOMP": 1000}, (
+            "the healthy wave-one region must not pick up a mark, and the "
+            "carried wave-two region must keep its own"
+        )
