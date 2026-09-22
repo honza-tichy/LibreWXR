@@ -506,7 +506,11 @@ class RadarFetcher:
         the first wave; everything else follows in the second.  An empty
         setting means one wave, i.e. the original all-at-once behaviour.
         """
-        priority = {g.strip().upper() for g in settings.radar_priority_groups}
+        priority = {
+            g.strip().upper()
+            for g in settings.radar_priority_groups.split(",")
+            if g.strip()
+        }
         if not priority:
             return [list(self._enabled_regions)]
         first = [r for r in self._enabled_regions if r.group.upper() in priority]

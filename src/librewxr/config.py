@@ -460,10 +460,17 @@ class Settings(BaseSettings):
     # Splitting by priority means an abandoned cycle costs the periphery
     # rather than the regions most clients are looking at.
     #
-    # Values are RegionDef.group names: US, CANADA, EUROPE,
+    # Comma-separated RegionDef.group names: US, CANADA, EUROPE,
     # CENTRAL_AMERICA, JAPAN, TAIWAN, SOUTHEAST_ASIA.  Set empty to fetch
     # everything in one wave (the original behaviour).
-    radar_priority_groups: list[str] = ["US", "CANADA", "EUROPE"]
+    #
+    # A comma-separated str, not a list[str], for the same reason
+    # enabled_regions above is: pydantic-settings decodes a list-typed
+    # field from the environment as JSON inside the settings source —
+    # before any field_validator can normalise it — so
+    # LIBREWXR_RADAR_PRIORITY_GROUPS=US,CANADA,EUROPE raised
+    # SettingsError at import and crash-looped the container.
+    radar_priority_groups: str = "US,CANADA,EUROPE"
     cors_origins: list[str] = ["*"]
 
     @field_validator("mode", mode="before")
