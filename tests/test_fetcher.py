@@ -1133,7 +1133,7 @@ class TestRegionPriorityWaves:
     async def test_priority_regions_are_fetched_first(self, monkeypatch):
         from librewxr.config import settings
 
-        monkeypatch.setattr(settings, "radar_priority_groups", ["US", "EUROPE"])
+        monkeypatch.setattr(settings, "radar_priority_groups", "US,EUROPE")
         monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
 
         uscomp = self._region("USCOMP", "US")
@@ -1169,7 +1169,7 @@ class TestRegionPriorityWaves:
         """The point of the split: abandoning the stage keeps wave one."""
         from librewxr.config import settings
 
-        monkeypatch.setattr(settings, "radar_priority_groups", ["US"])
+        monkeypatch.setattr(settings, "radar_priority_groups", "US")
         monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
 
         uscomp = self._region("USCOMP", "US")
@@ -1197,7 +1197,7 @@ class TestRegionPriorityWaves:
     async def test_empty_priority_list_keeps_one_wave(self, monkeypatch):
         from librewxr.config import settings
 
-        monkeypatch.setattr(settings, "radar_priority_groups", [])
+        monkeypatch.setattr(settings, "radar_priority_groups", "")
         uscomp = self._region("USCOMP", "US")
         twcomp = self._region("TWCOMP", "TAIWAN")
 
