@@ -453,6 +453,17 @@ class Settings(BaseSettings):
     # boundary it exists to protect.  540 s leaves room for the nowcast
     # tail.
     fetch_cycle_timeout: float = 540.0
+    # Region groups fetched before all others, as a separate gather-and-
+    # store pass.  A gather's results are consumed only once every task
+    # in it settles, so one all-regions gather loses the regions that
+    # already succeeded whenever the cycle budget abandons the stage.
+    # Splitting by priority means an abandoned cycle costs the periphery
+    # rather than the regions most clients are looking at.
+    #
+    # Values are RegionDef.group names: US, CANADA, EUROPE,
+    # CENTRAL_AMERICA, JAPAN, TAIWAN, SOUTHEAST_ASIA.  Set empty to fetch
+    # everything in one wave (the original behaviour).
+    radar_priority_groups: list[str] = ["US", "CANADA", "EUROPE"]
     cors_origins: list[str] = ["*"]
 
     @field_validator("mode", mode="before")

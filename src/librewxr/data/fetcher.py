@@ -499,14 +499,58 @@ class RadarFetcher:
 
         await self._fetch_timestamps(ts_and_sources, skip_regions=existing_frames)
 
+    def _region_waves(self) -> list[list[RegionDef]]:
+        """Split enabled regions into priority waves, highest first.
+
+        Regions whose group is listed in ``radar_priority_groups`` form
+        the first wave; everything else follows in the second.  An empty
+        setting means one wave, i.e. the original all-at-once behaviour.
+        """
+        priority = {g.strip().upper() for g in settings.radar_priority_groups}
+        if not priority:
+            return [list(self._enabled_regions)]
+        first = [r for r in self._enabled_regions if r.group.upper() in priority]
+        rest = [r for r in self._enabled_regions if r.group.upper() not in priority]
+        return [wave for wave in (first, rest) if wave]
+
     async def _fetch_timestamps(
         self,
         ts_and_sources: list[tuple[int, str, int | datetime]],
         skip_regions: dict[int, set[str]] | None = None,
     ) -> None:
-        """Fetch enabled regions for the given timestamps.
+        """Fetch the given timestamps, one priority wave of regions at a time.
+
+        Each wave is a separate gather-and-store pass, so a wave that
+        completes is written to the store before the next one starts.
+        That is the whole point of the split: the results of a gather are
+        consumed only after *every* task in it settles, so a single
+        all-regions gather loses the regions that already succeeded when
+        the cycle budget abandons the stage.  Fetching the regions most
+        users look at first means an abandoned cycle costs the periphery,
+        not the core.
+
+        The cost is latency in the worst case — two waves can each spend
+        up to ``radar_fetch_timeout`` instead of overlapping — which is
+        why the wave split is by group rather than per region.
+        """
+        for regions in self._region_waves():
+            await self._fetch_regions_for_timestamps(
+                ts_and_sources, regions, skip_regions=skip_regions,
+            )
+
+    async def _fetch_regions_for_timestamps(
+        self,
+        ts_and_sources: list[tuple[int, str, int | datetime]],
+        regions_to_fetch: list[RegionDef],
+        skip_regions: dict[int, set[str]] | None = None,
+    ) -> None:
+        """Fetch one wave of regions for the given timestamps.
 
         Args:
+            regions_to_fetch: the regions this pass covers.  Carry-forward
+                below is scoped to these too — carrying a later wave's
+                region here would copy stale data moments before that wave
+                fetches it fresh.
             skip_regions: Optional mapping of timestamp -> region names to
                 skip (already present in the store).  Only missing regions
                 are fetched, saving bandwidth on retries for incomplete frames.
@@ -522,7 +566,7 @@ class RadarFetcher:
 
         for ts, source_type, source_arg in ts_and_sources:
             have = skip_regions.get(ts, set()) if skip_regions else set()
-            for region in self._enabled_regions:
+            for region in regions_to_fetch:
                 if region.name in have:
                     continue
                 source = self._sources[region.name]
@@ -612,7 +656,11 @@ class RadarFetcher:
         # newer ones look back for missing regions).
         added = 0
         any_merged = False
-        enabled_names = {r.name for r in self._enabled_regions}
+        # This wave's regions only.  Carrying forward a region that a
+        # later wave is about to fetch would copy stale data seconds
+        # before the fresh copy lands, and log a misleading
+        # "carry-forward" line for a region that then succeeded.
+        enabled_names = {r.name for r in regions_to_fetch}
         interval = settings.fetch_interval
 
         for ts in sorted(frames_by_ts.keys()):

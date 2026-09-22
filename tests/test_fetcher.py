@@ -937,3 +937,101 @@ class TestFetchCycleBudget:
 
         assert calls.count("fetch") >= 1
         assert not any("exceeded its" in r.message for r in caplog.records)
+
+
+class TestRegionPriorityWaves:
+    """High-priority regions are fetched and stored before the rest.
+
+    asyncio.gather hands back results only once every task in it has
+    settled, so a single all-regions gather loses the regions that
+    already succeeded whenever the enclosing cycle budget abandons the
+    stage.  Splitting into waves writes each wave to the store before the
+    next starts, so an abandoned cycle costs the periphery rather than
+    the regions most clients look at.
+    """
+
+    def _region(self, name, group):
+        return RegionDef(
+            name=name,
+            west=0.0, east=3.2, south=0.0, north=3.2,
+            pixel_size=0.1, group=group,
+            grid_width=32, grid_height=32,
+        )
+
+    @pytest.mark.asyncio
+    async def test_priority_regions_are_fetched_first(self, monkeypatch):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", ["US", "EUROPE"])
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
+
+        uscomp = self._region("USCOMP", "US")
+        opera = self._region("OPERA", "EUROPE")
+        twcomp = self._region("TWCOMP", "TAIWAN")
+        svcomp = self._region("SVCOMP", "CENTRAL_AMERICA")
+
+        order: list[str] = []
+
+        class _OrderingSource(_FakeSource):
+            async def fetch_frame(self, region, minutes_ago):
+                order.append(region.name)
+                return self._build_array(region)
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, uscomp)
+        # Deliberately listed periphery-first, the order the discovery
+        # walker actually produces (SVCOMP, JPCOMP, TWCOMP, ... USCOMP).
+        fetcher._enabled_regions = [svcomp, twcomp, opera, uscomp]
+        fetcher._sources = {
+            r.name: _OrderingSource() for r in fetcher._enabled_regions
+        }
+
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+
+        assert set(order[:2]) == {"OPERA", "USCOMP"}
+        assert set(order[2:]) == {"SVCOMP", "TWCOMP"}
+
+    @pytest.mark.asyncio
+    async def test_priority_wave_lands_even_when_the_rest_hangs(
+        self, monkeypatch
+    ):
+        """The point of the split: abandoning the stage keeps wave one."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", ["US"])
+        monkeypatch.setattr(settings, "radar_fetch_timeout", 30.0)
+
+        uscomp = self._region("USCOMP", "US")
+        twcomp = self._region("TWCOMP", "TAIWAN")
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, uscomp)
+        fetcher._enabled_regions = [twcomp, uscomp]
+        fetcher._sources = {
+            uscomp.name: _FakeSource(fill_value=60),
+            twcomp.name: _HangingSource(),
+        }
+
+        # Abandon the whole stage the way fetch_cycle_timeout does.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                fetcher._fetch_timestamps([(1000, "live", 0)]), timeout=0.3,
+            )
+
+        frame = await store.get_frame(1000)
+        assert frame is not None
+        assert "USCOMP" in frame.regions
+
+    @pytest.mark.asyncio
+    async def test_empty_priority_list_keeps_one_wave(self, monkeypatch):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_priority_groups", [])
+        uscomp = self._region("USCOMP", "US")
+        twcomp = self._region("TWCOMP", "TAIWAN")
+
+        store = FrameStore(max_frames=8)
+        fetcher, _ = _build_fetcher(store, TileCache(max_mb=1), None, uscomp)
+        fetcher._enabled_regions = [twcomp, uscomp]
+
+        assert len(fetcher._region_waves()) == 1

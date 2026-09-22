@@ -1035,6 +1035,23 @@ Only the fetch stage is bounded. Nowcast generation and the state snapshot run e
 
 Must stay below `LIBREWXR_FETCH_INTERVAL` (default 600 s), or it cannot protect the boundary it exists to protect. 540 s leaves room for the nowcast tail.
 
+### `LIBREWXR_RADAR_PRIORITY_GROUPS`
+
+Comma-separated region groups fetched ahead of all others, as a separate gather-and-store pass.
+
+| | |
+|---|---|
+| **Default** | `US,CANADA,EUROPE` |
+| **Type** | comma-separated list of `RegionDef.group` names |
+
+Valid groups: `US`, `CANADA`, `EUROPE`, `CENTRAL_AMERICA`, `JAPAN`, `TAIWAN`, `SOUTHEAST_ASIA`. Set it empty to fetch every region in one pass, which is the behaviour prior to this setting.
+
+`asyncio.gather` hands back results only once *every* task in it has settled, so a single all-regions fetch discards the regions that already succeeded whenever `LIBREWXR_FETCH_CYCLE_TIMEOUT` abandons the stage. Splitting into waves writes each wave to the store before the next begins, so an abandoned cycle costs the periphery rather than the regions most clients are looking at.
+
+Order within the default region list is discovery order — alphabetical by continent directory (`CENTRAL_AMERICA`, `JAPAN`, `TAIWAN`, `EUROPE`, `US`…) — which has no relationship to traffic. Set this to whichever groups your audience actually uses.
+
+The cost is worst-case latency: two waves can each spend up to `LIBREWXR_RADAR_FETCH_TIMEOUT` rather than overlapping. That is why the split is by group rather than per region — two waves, not thirteen.
+
 ---
 
 ## Nowcasting
