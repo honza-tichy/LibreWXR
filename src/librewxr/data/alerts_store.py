@@ -3,15 +3,29 @@
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from shapely.geometry import Polygon, shape
 
 
 @dataclass
+class AlertText:
+    """The human-readable fields of one CAP ``<info>`` block in one language."""
+    event: str
+    description: str
+    area_desc: str
+
+
+@dataclass
 class AlertEntry:
-    """Parsed CAP alert with optional polygon geometry."""
+    """Parsed CAP alert with optional polygon geometry.
+
+    ``event``/``description``/``area_desc`` are in ``language`` (the first
+    language the CAP message lists).  ``translations`` holds the issuer's own
+    parallel ``<info>`` blocks in other languages, keyed by lower-cased CAP
+    language tag (e.g. ``"en-gb"``).
+    """
     source_id: str
     event: str
     description: str
@@ -21,6 +35,42 @@ class AlertEntry:
     area_desc: str
     url: str
     polygon: Optional[Polygon] = None
+    language: str = ""
+    translations: dict[str, AlertText] = field(default_factory=dict)
+
+    def localized(self, lang: Optional[str]) -> tuple[AlertText, str]:
+        """Best text for a requested language, plus the tag actually used."""
+        primary = AlertText(self.event, self.description, self.area_desc)
+        if not lang:
+            return primary, self.language
+        texts = {self.language: primary, **self.translations}
+        tag = pick_language(list(texts), lang)
+        if tag is None:
+            return primary, self.language
+        return texts[tag], tag
+
+
+def _base(tag: str) -> str:
+    return tag.lower().replace("_", "-").split("-")[0]
+
+
+def pick_language(available: list[str], wanted: str) -> Optional[str]:
+    """Choose among ``available`` CAP language tags for a requested one.
+
+    Exact tag, then same base language (``de`` ↔ ``de-DE``), then English.
+    ``None`` means nothing fits and the caller should use the original.
+    The first entry in ``available`` wins ties, so callers list the
+    original language first.
+    """
+    wanted = wanted.lower().replace("_", "-")
+    for tag in available:
+        if tag.lower() == wanted:
+            return tag
+    for base in (_base(wanted), "en"):
+        for tag in available:
+            if _base(tag) == base:
+                return tag
+    return None
 
 
 class AlertsStore:
@@ -80,6 +130,15 @@ class AlertsStore:
                         "expires": a.expires,
                         "area_desc": a.area_desc,
                         "url": a.url,
+                        "language": a.language,
+                        "translations": {
+                            tag: {
+                                "event": t.event,
+                                "description": t.description,
+                                "area_desc": t.area_desc,
+                            }
+                            for tag, t in a.translations.items()
+                        },
                         "polygon": (
                             a.polygon.__geo_interface__ if a.polygon is not None else None
                         ),
@@ -105,6 +164,11 @@ class AlertsStore:
                     area_desc=a["area_desc"],
                     url=a["url"],
                     polygon=shape(a["polygon"]) if a.get("polygon") else None,
+                    language=a.get("language", ""),
+                    translations={
+                        tag: AlertText(**t)
+                        for tag, t in (a.get("translations") or {}).items()
+                    },
                 )
                 for a in state.get("alerts", [])
             ]

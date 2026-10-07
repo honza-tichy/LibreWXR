@@ -13,6 +13,8 @@ class AlertProperties(BaseModel):
     description: str
     regions: list[str]
     uri: str
+    # Lower-cased CAP language tag of title/description/regions (e.g. "en-gb").
+    language: str | None = None
 
 
 class GeoJSONFeature(BaseModel):

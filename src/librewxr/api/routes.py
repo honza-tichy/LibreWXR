@@ -1771,6 +1771,15 @@ async def get_alerts(
     lon: float | None = Query(None, ge=-180, le=180, description="Longitude for point lookup"),
     bbox: str | None = Query(None, description="Bounding box: west,south,east,north"),
     simplify: float = Query(1000.0, ge=0, description="Polygon simplification tolerance in meters (0=off)"),
+    lang: str | None = Query(
+        None,
+        max_length=35,
+        description=(
+            "Preferred language (BCP-47, e.g. 'de'). Picks the issuer's own "
+            "translation when the CAP message carries one: exact tag, then "
+            "same base language, then English, else the original."
+        ),
+    ),
 ):
     """Weather alerts as GeoJSON FeatureCollection.
 
@@ -1779,6 +1788,8 @@ async def get_alerts(
       Tornado Watches) are resolved to zone polygons at ingest, so every
       alert is visible in point lookups without any per-request NWS query.
     - bbox: alerts intersecting the bounding box (polygon-only).
+    - lang: preferred text language; each feature's ``language`` says
+      which one it got.  Nothing is machine-translated.
     """
     if not alerts_enabled or alerts_store is None:
         raise HTTPException(status_code=503, detail="Alerts not available")
@@ -1830,22 +1841,27 @@ async def get_alerts(
         if deg_per_meter > 0 and geom is not None:
             geom = geom.simplify(deg_per_meter, preserve_topology=True)
 
+        # Every entry of one CAP message carries the same language set, so
+        # the language picked for the first holds for the whole group; area
+        # names are localized per entry since each area has its own.
+        text, language = first.localized(lang)
         regions: list[str] = []
         for a in group:
-            if a.area_desc and a.area_desc not in regions:
-                regions.append(a.area_desc)
-
+            area = a.localized(lang)[0].area_desc
+            if area and area not in regions:
+                regions.append(area)
         features.append(
             GeoJSONFeature(
                 type="Feature",
                 properties=AlertProperties(
-                    title=first.event,
+                    title=text.event,
                     severity=first.severity,
                     time=_parse_cap_time(first.effective),
                     expires=_parse_cap_time(first.expires),
-                    description=first.description,
+                    description=text.description,
                     regions=regions,
                     uri=first.url,
+                    language=language or None,
                 ),
                 geometry=mapping(geom) if geom is not None else None,
             )
