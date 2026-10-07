@@ -12,7 +12,7 @@ from shapely.geometry import Polygon
 
 from librewxr.api import routes
 from librewxr.data.alerts_fetcher import _extract_polygons_from_cap, _parse_cap_time
-from librewxr.data.alerts_store import AlertEntry, AlertsStore
+from librewxr.data.alerts_store import AlertEntry, AlertsStore, AlertText, pick_language
 from librewxr.data.store import FrameStore
 from librewxr.tiles.cache import TileCache
 
@@ -402,6 +402,148 @@ class TestCAPParsing:
         # First and last should be same after auto-close
         coords = list(entries[0].polygon.exterior.coords)
         assert coords[0] == coords[-1]
+
+
+_MULTILANG_CAP = """<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <info>
+    <language>cs</language>
+    <event>Silný vítr</event>
+    <description>Nárazy kolem 18 m/s.</description>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <area>
+      <areaDesc>Praha</areaDesc>
+      <polygon>50,14 50.1,14 50.1,14.1 50,14.1 50,14</polygon>
+    </area>
+    <area>
+      <areaDesc>Kladno</areaDesc>
+      <polygon>50.1,14 50.2,14 50.2,14.1 50.1,14.1 50.1,14</polygon>
+    </area>
+  </info>
+  <info>
+    <language>en-GB</language>
+    <event>Moderate Wind Related Impact</event>
+    <description>Gusts around 18 m/s.</description>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <area>
+      <areaDesc>Prague</areaDesc>
+      <polygon>50,14 50.1,14 50.1,14.1 50,14.1 50,14</polygon>
+    </area>
+    <area>
+      <areaDesc></areaDesc>
+      <polygon>50.1,14 50.2,14 50.2,14.1 50.1,14.1 50.1,14</polygon>
+    </area>
+  </info>
+  <info>
+    <language>de-DE</language>
+    <event>Sturmböen</event>
+    <description>Böen um 18 m/s.</description>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <area>
+      <areaDesc>Prag und Umgebung</areaDesc>
+      <polygon>50,14 50.1,14 50.1,14.1 50,14.1 50,14</polygon>
+    </area>
+  </info>
+</alert>"""
+
+
+class TestCAPTranslations:
+    def test_geometry_comes_from_primary_language_only(self):
+        entries = _extract_polygons_from_cap(_MULTILANG_CAP, "cz", "https://example.com/cap")
+        assert [e.area_desc for e in entries] == ["Praha", "Kladno"]
+        assert all(e.language == "cs" for e in entries)
+
+    def test_translations_paired_per_area(self):
+        praha, kladno = _extract_polygons_from_cap(_MULTILANG_CAP, "cz", "https://example.com/cap")
+        assert praha.translations["en-gb"] == AlertText(
+            "Moderate Wind Related Impact", "Gusts around 18 m/s.", "Prague"
+        )
+        # Empty translated area name falls back to the original.
+        assert kladno.translations["en-gb"].area_desc == "Kladno"
+        # de has one area against cs's two: text kept, area name not trusted.
+        assert praha.translations["de-de"].event == "Sturmböen"
+        assert praha.translations["de-de"].area_desc == "Praha"
+
+    def test_language_with_different_info_count_dropped(self):
+        cap = _MULTILANG_CAP.replace(
+            "</alert>",
+            """<info><language>cs</language><event>Druhá</event>
+            <area><areaDesc>X</areaDesc></area></info></alert>""",
+        )
+        entries = _extract_polygons_from_cap(cap, "cz", "https://example.com/cap")
+        assert entries and all(e.translations == {} for e in entries)
+
+    def test_pick_language(self):
+        tags = ["cs", "en-gb", "de-de"]
+        assert pick_language(tags, "de") == "de-de"
+        assert pick_language(tags, "DE-AT") == "de-de"
+        assert pick_language(tags, "en-GB") == "en-gb"
+        assert pick_language(tags, "it") == "en-gb"
+        assert pick_language(["cs"], "it") is None
+        # The original wins ties: listed first.
+        assert pick_language(["en-us", "en-gb"], "en") == "en-us"
+
+    def test_localized(self):
+        praha = _extract_polygons_from_cap(_MULTILANG_CAP, "cz", "https://example.com/cap")[0]
+        assert praha.localized(None) == (AlertText("Silný vítr", "Nárazy kolem 18 m/s.", "Praha"), "cs")
+        assert praha.localized("cs-CZ")[1] == "cs"
+        assert praha.localized("pt")[0].event == "Moderate Wind Related Impact"
+
+    def test_round_trip_keeps_translations(self):
+        entries = _extract_polygons_from_cap(_MULTILANG_CAP, "cz", "https://example.com/cap")
+        producer = AlertsStore()
+        producer.replace_all(entries)
+        consumer = AlertsStore()
+        consumer.__setstate__(json.loads(json.dumps(producer.__getstate__())))
+        restored = consumer.alerts[0]
+        assert restored.language == "cs"
+        assert restored.translations == entries[0].translations
+
+
+@pytest.mark.alerts
+class TestAlertsLanguageParam:
+    @pytest.fixture
+    def store(self):
+        poly = Polygon([(14, 50), (14.1, 50), (14.1, 50.1), (14, 50.1), (14, 50)])
+        store = AlertsStore()
+        store.replace_all([
+            AlertEntry(
+                source_id="cz", event="Silný vítr", description="Nárazy",
+                severity="Moderate", effective="", expires="2099-01-01T00:00:00Z",
+                area_desc="Praha", url="https://example.com/cz", polygon=poly,
+                language="cs",
+                translations={"en-gb": AlertText("Wind", "Gusts", "Prague")},
+            ),
+        ])
+        return store
+
+    async def _get(self, store, query):
+        app = FastAPI()
+        app.include_router(routes.router)
+        routes.alerts_store = store
+        routes.alerts_enabled = True
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get(f"/v2/alerts?lat=50.05&lon=14.05{query}")
+        assert resp.status_code == 200
+        return resp.json()["features"][0]["properties"]
+
+    async def test_without_lang_returns_original(self, store):
+        props = await self._get(store, "")
+        assert (props["title"], props["language"]) == ("Silný vítr", "cs")
+
+    async def test_lang_picks_translation(self, store):
+        props = await self._get(store, "&lang=de")
+        assert props["title"] == "Wind"
+        assert props["regions"] == ["Prague"]
+        assert props["language"] == "en-gb"
+
+    async def test_lang_matching_original(self, store):
+        props = await self._get(store, "&lang=cs")
+        assert props["title"] == "Silný vítr"
 
 
 @pytest.mark.alerts

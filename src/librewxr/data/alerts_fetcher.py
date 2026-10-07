@@ -15,7 +15,7 @@ from lxml import etree
 from shapely.geometry import Polygon, shape
 
 from librewxr.config import settings
-from librewxr.data.alerts_store import AlertEntry, AlertsStore
+from librewxr.data.alerts_store import AlertEntry, AlertsStore, AlertText
 from librewxr.data.retry import retry_get
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,60 @@ def _cap_text(elem: etree._Element, tag: str, ns: dict[str, str]) -> str:
     return (elem.findtext(tag, default="") or "").strip()
 
 
+def _info_language(info: etree._Element, ns: dict[str, str]) -> str:
+    lang_elem = info.find("cap:language" if ns else "language", ns)
+    if lang_elem is None:
+        return "unknown"
+    # CAP's default language is en-US when <language> is present but empty.
+    return (lang_elem.text or "").strip().lower() or "en-us"
+
+
+def _info_texts(info: etree._Element, ns: dict[str, str]) -> tuple[str, str]:
+    """(event, description) for one <info>, per Pirate Weather's rules."""
+    event = _cap_text(info, "event", ns) or None
+    headline = _cap_text(info, "headline", ns) or None
+    description = _cap_text(info, "description", ns) or None
+
+    description_text = description or headline or ""
+    if headline and description:
+        event_text = headline
+    else:
+        event_text = event or ""
+    return event_text, description_text
+
+
+def _area_descs(info: etree._Element, ns: dict[str, str]) -> list[str]:
+    return [
+        (area.findtext("cap:areaDesc" if ns else "areaDesc", "", ns) or "").strip()
+        for area in info.findall("cap:area" if ns else "area", ns)
+    ]
+
+
+def _translations_for(
+    index: int,
+    by_lang: dict[str, list[etree._Element]],
+    primary_lang: str,
+    ns: dict[str, str],
+) -> list[tuple[str, str, str, list[str]]]:
+    """Other-language texts of the ``index``-th primary-language <info>.
+
+    Issuers repeat the whole <info> block per language, so the n-th block
+    of each language describes the same warning.  A language whose block
+    count differs from the primary's can't be paired safely and is dropped.
+    Returns ``(lang, event, description, area_descs)`` per language.
+    """
+    primary_count = len(by_lang[primary_lang])
+    out: list[tuple[str, str, str, list[str]]] = []
+    for lang, infos in by_lang.items():
+        if lang == primary_lang or len(infos) != primary_count:
+            continue
+        info = infos[index]
+        event_text, description_text = _info_texts(info, ns)
+        if event_text or description_text:
+            out.append((lang, event_text, description_text, _area_descs(info, ns)))
+    return out
+
+
 def _extract_polygons_from_cap(
     cap_xml: str,
     source_id: str,
@@ -71,8 +125,9 @@ def _extract_polygons_from_cap(
     """Parse CAP XML and return a list of AlertEntry objects.
 
     Adapted from Pirate Weather's WMO_Alerts_Local.py.
-    Handles CAP 1.1/1.2 namespaces, duplicate-language skipping,
-    polygon extraction, and EMMA_ID → polygon conversion.
+    Handles CAP 1.1/1.2 namespaces, polygon extraction, and EMMA_ID →
+    polygon conversion.  Geometry comes from the first language's <info>
+    blocks; the other languages' blocks become ``translations``.
     """
     results: list[AlertEntry] = []
     try:
@@ -87,46 +142,60 @@ def _extract_polygons_from_cap(
         cap_ns = root.tag.split("}")[0].strip("{")
         ns = {"cap": cap_ns}
 
-    seen_languages: set[str] = set()
-
+    by_lang: dict[str, list[etree._Element]] = {}
     for info in root.findall(".//cap:info" if ns else ".//info", ns):
-        lang_elem = info.find("cap:language" if ns else "language", ns)
-        lang = (
-            (lang_elem.text or "").strip().lower()
-            if lang_elem is not None
-            else "unknown"
-        )
+        by_lang.setdefault(_info_language(info, ns), []).append(info)
+    if not by_lang:
+        return results
 
-        # Use only the first language encountered for this alert
-        if not seen_languages:
-            seen_languages.add(lang)
-        elif lang not in seen_languages:
-            seen_languages.add(lang)
-            continue  # Skip additional languages
+    primary_lang = next(iter(by_lang))
+    primary_infos = by_lang[primary_lang]
 
+    for index, info in enumerate(primary_infos):
         urgency = _cap_text(info, "urgency", ns)
         if urgency.lower() == "past":
             continue
 
-        # Event / headline / description logic (from Pirate Weather)
-        event = _cap_text(info, "event", ns) or None
-        headline = _cap_text(info, "headline", ns) or None
-        description = _cap_text(info, "description", ns) or None
-
-        description_text = description or headline or ""
-        if headline and description:
-            event_text = headline
-        else:
-            event_text = event or ""
-
+        event_text, description_text = _info_texts(info, ns)
         severity = _cap_text(info, "severity", ns)
         effective = _cap_text(info, "effective", ns) or _cap_text(info, "onset", ns)
         expires = _cap_text(info, "expires", ns)
+        others = _translations_for(index, by_lang, primary_lang, ns)
+        areas = info.findall("cap:area" if ns else "area", ns)
 
-        for area in info.findall("cap:area" if ns else "area", ns):
+        for area_index, area in enumerate(areas):
             area_desc = (
                 area.findtext("cap:areaDesc" if ns else "areaDesc", "", ns) or ""
             ).strip()
+
+            # Area names are paired by position too; a mismatched count
+            # keeps the original name rather than risk naming the wrong area.
+            translations = {
+                lang: AlertText(
+                    event=t_event or event_text,
+                    description=t_description or description_text,
+                    area_desc=(
+                        (t_descs[area_index] or area_desc)
+                        if len(t_descs) == len(areas) else area_desc
+                    ),
+                )
+                for lang, t_event, t_description, t_descs in others
+            }
+
+            def entry(poly: Polygon) -> AlertEntry:
+                return AlertEntry(
+                    source_id=source_id,
+                    event=event_text,
+                    description=description_text,
+                    severity=severity,
+                    effective=effective,
+                    expires=expires,
+                    area_desc=area_desc,
+                    url=cap_url,
+                    polygon=poly,
+                    language=primary_lang,
+                    translations=translations,
+                )
 
             # Extract geocode entries
             geocode_entries: list[tuple[Optional[str], Optional[str]]] = []
@@ -169,19 +238,7 @@ def _extract_polygons_from_cap(
                     try:
                         poly = Polygon(coords)
                         has_polygon = True
-                        results.append(
-                            AlertEntry(
-                                source_id=source_id,
-                                event=event_text,
-                                description=description_text,
-                                severity=severity,
-                                effective=effective,
-                                expires=expires,
-                                area_desc=area_desc,
-                                url=cap_url,
-                                polygon=poly,
-                            )
-                        )
+                        results.append(entry(poly))
                     except Exception as exc:
                         logger.warning("Polygon construction failed for %s: %s", source_id, exc)
                         continue
@@ -198,19 +255,7 @@ def _extract_polygons_from_cap(
                     ):
                         poly = meteoalarm.get(geocode_value)
                     if poly is not None:
-                        results.append(
-                            AlertEntry(
-                                source_id=source_id,
-                                event=event_text,
-                                description=description_text,
-                                severity=severity,
-                                effective=effective,
-                                expires=expires,
-                                area_desc=area_desc,
-                                url=cap_url,
-                                polygon=poly,
-                            )
-                        )
+                        results.append(entry(poly))
 
     return results
 
@@ -435,6 +480,7 @@ class WMOAlertsFetcher:
                     area_desc=props.get("areaDesc", ""),
                     url=props.get("id", "") or feature.get("id", ""),
                     polygon=polygon,
+                    language="en-us",
                 )
             )
 

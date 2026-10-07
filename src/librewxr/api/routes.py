@@ -717,6 +717,7 @@ async def _fetch_nws_point_alerts(lat: float, lon: float) -> list[GeoJSONFeature
                     description=desc,
                     regions=[props.get("areaDesc", "")] if props.get("areaDesc") else [],
                     uri=props.get("id", "") or feature.get("id", ""),
+                    language="en-us",
                 ),
                 geometry=geom,
             )
@@ -733,6 +734,15 @@ async def get_alerts(
     lon: float | None = Query(None, ge=-180, le=180, description="Longitude for point lookup"),
     bbox: str | None = Query(None, description="Bounding box: west,south,east,north"),
     simplify: float = Query(1000.0, ge=0, description="Polygon simplification tolerance in meters (0=off)"),
+    lang: str | None = Query(
+        None,
+        max_length=35,
+        description=(
+            "Preferred language (BCP-47, e.g. 'de'). Picks the issuer's own "
+            "translation when the CAP message carries one: exact tag, then "
+            "same base language, then English, else the original."
+        ),
+    ),
 ):
     """Weather alerts as GeoJSON FeatureCollection.
 
@@ -741,6 +751,8 @@ async def get_alerts(
       the NWS point endpoint to include alerts (e.g. Tornado Watches) that
       lack polygon geometry in the global feed.
     - bbox: alerts intersecting the bounding box (polygon-only).
+    - lang: preferred text language; each feature's ``language`` says
+      which one it got.  Nothing is machine-translated.
     """
     if not alerts_enabled or alerts_store is None:
         raise HTTPException(status_code=503, detail="Alerts not available")
@@ -791,17 +803,19 @@ async def get_alerts(
             continue
         seen_uris.add(uri)
 
+        text, language = alert.localized(lang)
         features.append(
             GeoJSONFeature(
                 type="Feature",
                 properties=AlertProperties(
-                    title=alert.event,
+                    title=text.event,
                     severity=alert.severity,
                     time=_parse_cap_time(alert.effective),
                     expires=_parse_cap_time(alert.expires),
-                    description=alert.description,
-                    regions=[alert.area_desc] if alert.area_desc else [],
+                    description=text.description,
+                    regions=[text.area_desc] if text.area_desc else [],
                     uri=uri,
+                    language=language or None,
                 ),
                 geometry=mapping(geom) if geom is not None else None,
             )
