@@ -20,9 +20,13 @@ no per-country directory.
 
 ## Cadence & latency
 
-- Native cadence: **5 min**.
-- Files publish with ~5–10 min delay; the source walks back up to 3
-  older slots on 404 (`_MAX_FALLBACK_STEPS = 3`).
+- Native cadence: **5 min**, but only the `fetch_interval`-aligned
+  (:x0) composites are used.  AEMET (Spain) scans every 10 min, so the
+  :x5 composites lack most of Iberia and a frame built from one shows
+  the peninsula dry.
+- Files publish ~4 min after their slot; the source falls back one :x0
+  slot on 404 (`_MAX_FALLBACK_STEPS = 1`) and otherwise returns `None`
+  so the fetcher's carry-forward/refetch path takes over.
 - Archive: **rolling 24 hours** at the S3 bucket — older frames are
   pruned upstream.
 

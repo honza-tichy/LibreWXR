@@ -23,6 +23,7 @@ import h5py
 import httpx
 import numpy as np
 
+from librewxr.config import settings
 from librewxr.data.regions import RegionDef
 from librewxr.data.retry import retry_get
 from librewxr.sources._helpers import HDF5_LOCK, _dbz_float_to_uint8
@@ -38,9 +39,14 @@ class OperaSource:
     """
 
     _S3_PATH = "/openradar-24h"
-    # OPERA files are published with a ~5-10 minute delay; try up to
-    # 3 older 5-minute slots if the target timestamp 404s.
-    _MAX_FALLBACK_STEPS = 3
+    # Composites are only ever taken from fetch_interval-aligned (:x0)
+    # slots.  OPERA publishes every 5 minutes, but AEMET (all of Spain)
+    # scans every 10, so the :x5 composites lack most of Iberia — a frame
+    # built from one shows the peninsula dry.  Files land ~4 minutes after
+    # their slot, so the frame's own slot usually 404s when the cycle
+    # starts on the boundary; fall back one :x0 slot, and past that let the
+    # fetcher's carry-forward/refetch path handle the gap.
+    _MAX_FALLBACK_STEPS = 1
 
     def __init__(self, base_url: str = "https://s3.waw3-1.cloudferro.com"):
         self._base_url = base_url.rstrip("/")
@@ -65,13 +71,12 @@ class OperaSource:
     async def fetch_frame(
         self, region: RegionDef, minutes_ago: int
     ) -> np.ndarray | None:
-        # OPERA composites are published every 5 minutes; round to nearest
-        # 5-min slot so the fallback chain finds the right file.
-        now_rounded = int(time.time() // 300) * 300
-        target_ts = now_rounded - minutes_ago * 60
-        # Snap to the nearest 5-min slot for the target as well
-        target_ts = int(target_ts // 300) * 300
-        return await self._fetch_hdf5(target_ts)
+        # Target the frame's own slot: the fetcher labels frames on
+        # fetch_interval boundaries, and only those composites carry the
+        # 10-minute radar fleets (see _MAX_FALLBACK_STEPS).
+        interval = settings.fetch_interval
+        now_rounded = int(time.time() // interval) * interval
+        return await self._fetch_hdf5(now_rounded - minutes_ago * 60)
 
     async def fetch_archive_frame(
         self, region: RegionDef, dt: datetime
@@ -79,10 +84,12 @@ class OperaSource:
         return await self._fetch_hdf5(int(dt.timestamp()))
 
     async def _fetch_hdf5(self, ts: int) -> np.ndarray | None:
-        """Download and parse, falling back to older slots on 404."""
+        """Download and parse, falling back to older :x0 slots on 404."""
         client = await self._get_client()
+        interval = settings.fetch_interval
+        ts = (ts // interval) * interval
         for step in range(self._MAX_FALLBACK_STEPS + 1):
-            url = self._url_for_timestamp(ts - step * 300)
+            url = self._url_for_timestamp(ts - step * interval)
             resp = await retry_get(client, url, log_name="OPERA")
             if resp is None:
                 return None

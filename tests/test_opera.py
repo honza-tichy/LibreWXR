@@ -152,3 +152,77 @@ class TestOperaSourceURL:
         dt = datetime(2026, 4, 10, 9, 7, tzinfo=timezone.utc)
         url = src._url_for_timestamp(int(dt.timestamp()))
         assert "T0905@" in url
+
+
+class TestOperaSlotSelection:
+    """Frames only ever use fetch_interval-aligned (:x0) composites.
+
+    The :x5 composites lack AEMET's 10-minute fleet, so a frame built from
+    one shows Spain dry (2026-10-19, Tarragona).
+    """
+
+    class _Resp:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.content = b""
+
+    def _run(self, monkeypatch, now, available):
+        import time as _time
+        from datetime import datetime, timezone
+
+        from librewxr.sources.regional.europe.radar.opera import source as mod
+
+        requested: list[str] = []
+
+        async def fake_get(client, url, log_name=""):
+            slot = url.split("@")[1]
+            requested.append(slot[-4:])
+            return self._Resp(200 if slot[-4:] in available else 404)
+
+        monkeypatch.setattr(mod, "retry_get", fake_get)
+        monkeypatch.setattr(mod, "_parse_opera_hdf5", lambda data: np.zeros((1, 1), np.uint8))
+        monkeypatch.setattr(mod.settings, "fetch_interval", 600)
+        ts = datetime(2026, 10, 19, *now, tzinfo=timezone.utc).timestamp()
+        monkeypatch.setattr(mod.time, "time", lambda: ts)
+
+        import asyncio
+        src = OperaSource("https://example.com")
+        result = asyncio.run(src.fetch_frame(REGIONS["OPERA"], 0))
+        return requested, result
+
+    def test_live_frame_uses_its_own_x0_slot(self, monkeypatch):
+        # Cycle at 10:16 for the frame labelled 10:10: never 10:15.
+        requested, result = self._run(monkeypatch, (10, 16), {"1010", "1015"})
+        assert requested == ["1010"]
+        assert result is not None
+
+    def test_fallback_steps_to_previous_x0_slot(self, monkeypatch):
+        # 10:10 not yet published: take 10:00, skipping the partial 10:05.
+        requested, result = self._run(monkeypatch, (10, 11), {"1000", "1005"})
+        assert requested == ["1010", "1000"]
+        assert result is not None
+
+    def test_gives_up_after_one_fallback(self, monkeypatch):
+        # Neither :x0 slot available: return None so the fetcher's
+        # carry-forward/refetch path takes over, never an :x5 composite.
+        requested, result = self._run(monkeypatch, (10, 11), {"1005", "0955"})
+        assert requested == ["1010", "1000"]
+        assert result is None
+
+    def test_archive_frame_snaps_to_x0(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        from librewxr.sources.regional.europe.radar.opera import source as mod
+
+        requested: list[str] = []
+
+        async def fake_get(client, url, log_name=""):
+            requested.append(url.split("@")[1][-4:])
+            return self._Resp(404)
+
+        monkeypatch.setattr(mod, "retry_get", fake_get)
+        monkeypatch.setattr(mod.settings, "fetch_interval", 600)
+        import asyncio
+        dt = datetime(2026, 10, 19, 9, 50, tzinfo=timezone.utc)
+        asyncio.run(OperaSource("https://example.com").fetch_archive_frame(REGIONS["OPERA"], dt))
+        assert requested == ["0950", "0940"]
